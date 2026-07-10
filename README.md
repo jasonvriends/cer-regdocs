@@ -12,7 +12,7 @@ REGDOCS is the Canada Energy Regulator's public library of regulatory documents.
 # one-time setup
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt   # includes plotly for the web UI charts
 
 # run the full pipeline for one week
 python regdocs.py all --start-date 2026-06-01 --end-date 2026-06-07 --limit 10
@@ -52,6 +52,15 @@ python regdocs_ui.py --share            # public Gradio link (temporary)
 python regdocs_ui.py --host 0.0.0.0     # accessible on your LAN
 ```
 
+The web UI includes:
+- **Explore** — auto-discovered patterns: filing volume, fastest/slowest filings, duration by company
+- **Timeline** — Gantt chart of filing durations, filterable by company/type/commodity
+- **Ask** — RAG Q&A with clickable example queries
+- **Trends** — duration analysis with percentile estimates
+- **Search** — keyword search across all documents
+- **Compliance** — gap detection (Orders without Compliance filings)
+- **Dashboard** — pipeline status and health
+
 ---
 
 ## Architecture
@@ -82,7 +91,7 @@ python regdocs_ui.py --host 0.0.0.0     # accessible on your LAN
 |---------|-------------|
 | `scout` | Crawls REGDOCS for a date range, inserts documents with `status=NEW` |
 | `download` | Downloads files for all `NEW` documents, marks them `DOWNLOADED` |
-| `convert` | Converts `DOWNLOADED` files to Markdown via Docling (GPU/OCR), marks `CONVERTED` |
+| `convert` | Converts `DOWNLOADED` files to Markdown via Docling (auto-detects GPU/CPU, OCR for English + French), marks `CONVERTED` |
 | `index` | Chunks Markdown and embeds into ChromaDB using Ollama |
 | `ask` | Retrieves relevant chunks and answers via Ollama LLM |
 | `summarize` | Extracts structured data (conditions, dates, status) into a table |
@@ -175,6 +184,15 @@ The database accumulates state across runs — no shell loops needed.
 ```bash
 # Collect a full year
 python regdocs.py all --start-date 2026-01-01 --end-date 2026-12-31
+
+# Force re-download only (don't re-index)
+python regdocs.py all --start-date 2026-06-01 --end-date 2026-06-30 --force-download
+
+# Force re-index only (don't re-download)
+python regdocs.py all --start-date 2026-06-01 --end-date 2026-06-30 --force-index
+
+# Force everything (re-download AND re-index)
+python regdocs.py all --start-date 2026-06-01 --end-date 2026-06-30 --force
 
 # Keep data fresh (last 30 days) — safe to run daily
 python regdocs.py watch --days 30
@@ -282,8 +300,9 @@ python regdocs.py diff 4642847 4642848
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--output-dir` | `markdown` | Where to save Markdown files |
-| `--concurrency` | `1` | Parallel conversions |
+| `--concurrency` | `1` | Parallel conversions (capped at 1 — Docling is not thread-safe) |
 | `--max-retries` | `3` | Max retry attempts |
+| `--timeout` | `300` | Timeout per document in seconds (increase for large scanned PDFs) |
 | `--dry-run` | off | Show what would be converted |
 
 ### index

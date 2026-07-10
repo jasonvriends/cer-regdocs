@@ -613,7 +613,14 @@ async def download_one(
                 if file_path and Path(file_path).exists():
                     counters["already"] += 1
                     return
+                # Also check by doc_id prefix in case the name changed since download
                 existing = existing_by_stem.get(f"{doc_id}_{slug_name}")
+                if not existing:
+                    # Check if any file starts with this doc_id (handles name changes)
+                    existing = next(
+                        (p for stem, p in existing_by_stem.items() if stem.startswith(f"{doc_id}_")),
+                        None,
+                    )
                 if existing:
                     counters["already"] += 1
                     return
@@ -736,7 +743,7 @@ async def run_download(args) -> None:
 
     db = get_db(config.db_path)
 
-    records = db.get_pending_downloads(max_retries=config.max_retries)
+    records = db.get_pending_downloads(max_retries=config.max_retries, include_html=config.include_html)
     logging.info(f"Found {len(records)} documents to download")
 
     # Dry-run mode: just show what would be downloaded
@@ -794,7 +801,7 @@ async def run_download(args) -> None:
 
 def preprocess_html(source_path: Path, target_path: Path) -> None:
     """Replace image references in HTML with text equivalents."""
-    soup = BeautifulSoup(source_path.read_text(encoding="utf-8", errors="replace"), "lxml")
+    soup = BeautifulSoup(source_path.read_text(encoding="utf-8", errors="replace"), SOUP_PARSER)
     for img in soup.find_all("img"):
         src_name = Path(str(img.get("src", ""))).name.lower()
         if src_name in ("yes.png", "checked.png"):
@@ -809,7 +816,7 @@ def preprocess_html(source_path: Path, target_path: Path) -> None:
 
 
 def get_converter():
-    """Initialize the Docling document converter with GPU support."""
+    """Initialize the Docling document converter with GPU support if available."""
     # Late import — docling is heavy and only needed for convert
     from docling.datamodel.base_models import InputFormat
     from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -835,12 +842,25 @@ def get_converter():
         AcceleratorOptions,
     )
 
+    # Auto-detect GPU availability
+    device = "cpu"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device = "cuda"
+            logging.info("CUDA GPU detected — using GPU acceleration")
+        else:
+            logging.info("No CUDA GPU — using CPU (conversion will be slower)")
+    except ImportError:
+        logging.info("PyTorch not available — using CPU")
+
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_table_structure = True
     pipeline_options.do_formula_enrichment = True
     pipeline_options.do_ocr = True
-    pipeline_options.accelerator_options = AcceleratorOptions(device="cuda", num_threads=1)
-    pipeline_options.ocr_options = EasyOcrOptions(lang=["en"])
+    pipeline_options.accelerator_options = AcceleratorOptions(device=device, num_threads=4 if device == "cpu" else 1)
+    # CER documents are bilingual (English + French)
+    pipeline_options.ocr_options = EasyOcrOptions(lang=["en", "fr"])
 
     return DocumentConverter(
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
@@ -908,6 +928,7 @@ async def convert_one(
     semaphore: asyncio.Semaphore,
     progress: tqdm,
     counters: Dict[str, int],
+    timeout: int = 300,
 ) -> None:
     """Convert a single document to Markdown."""
     async with semaphore:
@@ -932,8 +953,8 @@ async def convert_one(
 
             markdown_path = output_dir / f"{doc_id}_{slug_name}.md"
 
-            # Idempotency: skip if already converted and file unchanged
-            if markdown_path.exists() and markdown_path.stat().st_size > 500:
+            # Idempotency: skip if already converted (any non-empty file)
+            if markdown_path.exists() and markdown_path.stat().st_size > 0:
                 counters["already"] += 1
                 return
 
@@ -950,7 +971,7 @@ async def convert_one(
 
                 result = await asyncio.wait_for(
                     loop.run_in_executor(None, converter.convert, convert_path),
-                    timeout=300,
+                    timeout=timeout,
                 )
 
                 # Build page-annotated markdown using Docling provenance
@@ -990,7 +1011,7 @@ async def convert_one(
 
             except asyncio.TimeoutError:
                 duration_ms = (time.monotonic() - t0) * 1000
-                db.mark_failed(doc_id, "Timeout after 300s", "convert")
+                db.mark_failed(doc_id, f"Timeout after {timeout}s", "convert")
                 db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
                                  duration_ms=duration_ms, error_type="timeout")
                 counters["errors"] += 1
@@ -1024,6 +1045,15 @@ async def run_convert(args) -> None:
     output_dir = Path(args.output_dir)
     concurrency = max(1, args.concurrency)
     max_retries = getattr(args, 'max_retries', 3)
+
+    # Docling's converter is NOT thread-safe (uses GPU models internally).
+    # Force concurrency=1 to prevent CUDA/model corruption.
+    if concurrency > 1:
+        logging.warning(
+            f"Convert concurrency capped at 1 (requested {concurrency}). "
+            "Docling's PDF converter is not thread-safe."
+        )
+        concurrency = 1
 
     db = get_db(db_path)
 
@@ -1075,7 +1105,8 @@ async def run_convert(args) -> None:
     try:
         with tqdm(total=len(records), desc="Converting", unit=" file") as pbar:
             tasks = [
-                convert_one(converter, rec, output_dir, db, semaphore, pbar, counters)
+                convert_one(converter, rec, output_dir, db, semaphore, pbar, counters,
+                            timeout=getattr(args, 'timeout', 300))
                 for rec in records
             ]
             await asyncio.gather(*tasks)
@@ -1438,6 +1469,12 @@ def run_index(args) -> None:
     chroma_dir = Path(args.chroma_dir)
     chunk_size = getattr(args, 'chunk_size', CHUNK_SIZE)
     overlap = getattr(args, 'overlap', CHUNK_OVERLAP)
+
+    # Validate overlap < chunk_size to prevent chunk explosion
+    if overlap >= chunk_size:
+        logging.error(f"--overlap ({overlap}) must be less than --chunk-size ({chunk_size})")
+        sys.exit(1)
+
     chroma_dir.mkdir(parents=True, exist_ok=True)
 
     db = get_db(db_path)
@@ -2883,6 +2920,16 @@ async def run_all(args) -> None:
     """Run scout -> download -> convert -> index in sequence."""
     logging.info("Running full pipeline: scout -> download -> convert -> index")
 
+    # Resolve --force shorthand into the specific flags
+    if getattr(args, 'force', False):
+        args.force_download = True
+        args.force_index = True
+
+    # Map split flags for sub-stages that expect args.force
+    # Download stage reads args.force
+    original_force = getattr(args, 'force', False)
+    args.force = getattr(args, 'force_download', False)
+
     logging.info("=" * 60)
     logging.info("STAGE 1: Scout")
     logging.info("=" * 60)
@@ -2899,10 +2946,16 @@ async def run_all(args) -> None:
         logging.info("=" * 60)
         await run_convert(args)
 
+        # Index stage reads args.force
+        args.force = getattr(args, 'force_index', False)
+
         logging.info("=" * 60)
         logging.info("STAGE 4: Index")
         logging.info("=" * 60)
         run_index(args)
+
+    # Restore for stats
+    args.force = original_force
 
     logging.info("=" * 60)
     logging.info("Pipeline complete. Final stats:")
@@ -3043,6 +3096,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Max parallel conversions")
     conv_p.add_argument("--max-retries", type=int, default=3,
                         help="Max retry attempts for failed conversions")
+    conv_p.add_argument("--timeout", type=int, default=300,
+                        help="Timeout per document in seconds (default: 300s = 5 min)")
     conv_p.add_argument("--dry-run", action="store_true", help="Show what would be converted without converting")
 
     # --- all ---
@@ -3064,7 +3119,9 @@ def build_parser() -> argparse.ArgumentParser:
     all_p.add_argument("--max-retries", type=int, default=3,
                        help="Max retry attempts for failures")
     all_p.add_argument("--output-dir", default="downloads", help="Directory for downloaded files")
-    all_p.add_argument("--force", action="store_true", help="Re-download existing files")
+    all_p.add_argument("--force-download", action="store_true", help="Re-download existing files")
+    all_p.add_argument("--force-index", action="store_true", help="Re-index already indexed documents")
+    all_p.add_argument("--force", action="store_true", help="Re-download AND re-index (shorthand for both --force-download --force-index)")
     all_p.add_argument("--include-html", action="store_true", help="Also download HTML documents")
     all_p.add_argument("--dry-run", action="store_true", help="Crawl but write nothing")
     all_p.add_argument("--chroma-dir", default=str(CHROMA_DIR),

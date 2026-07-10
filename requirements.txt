@@ -7,3 +7,4 @@ easyocr==1.7.2
 chromadb==1.5.9
 ollama==0.6.2
 gradio==5.34.2
+plotly==6.9.0

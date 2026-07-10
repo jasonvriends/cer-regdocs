@@ -191,6 +191,7 @@ class RegDocsDB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -207,6 +208,11 @@ class RegDocsDB:
             self.conn.execute(_MIGRATION_ADD_RETRY_COUNT)
 
     def close(self) -> None:
+        # Checkpoint WAL to ensure all writes are flushed to the main database file
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
         self.conn.close()
 
     def __enter__(self):
@@ -232,21 +238,45 @@ class RegDocsDB:
         If the document already exists, name/url/metadata are refreshed but
         the lifecycle status is preserved (DOWNLOADED/CONVERTED stay as-is).
         New URLs that aren't tracked yet get inserted with status=NEW.
+
+        Metadata is MERGED (not replaced) on update: scout-time fields are
+        refreshed while download/convert fields (downloaded_at, extension,
+        size_bytes, quality_score, etc.) are preserved.
         """
         now = _now_iso()
         meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
-        self.conn.execute(
-            """
-            INSERT INTO documents (id, name, url, status, metadata, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                url = excluded.url,
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at
-            """,
-            (doc_id, name, url, status, meta_json, now, now),
-        )
+
+        # Check if document already exists to merge metadata
+        existing = self.conn.execute(
+            "SELECT metadata FROM documents WHERE id = ?", (doc_id,)
+        ).fetchone()
+
+        if existing:
+            # Merge: start with existing metadata, overlay new scout fields
+            existing_meta = json.loads(existing["metadata"]) if existing["metadata"] else {}
+            if metadata:
+                # Preserve download/convert fields that the scout doesn't provide
+                preserve_keys = {
+                    "downloaded_at", "extension", "content_type", "size_bytes",
+                    "server_filename", "final_url", "last_modified",
+                    "quality_score",
+                }
+                for key in preserve_keys:
+                    if key in existing_meta and key not in metadata:
+                        metadata[key] = existing_meta[key]
+                meta_json = json.dumps(metadata, ensure_ascii=False)
+
+            self.conn.execute(
+                """UPDATE documents SET name = ?, url = ?, metadata = ?, updated_at = ?
+                   WHERE id = ?""",
+                (name, url, meta_json, now, doc_id),
+            )
+        else:
+            self.conn.execute(
+                """INSERT INTO documents (id, name, url, status, metadata, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (doc_id, name, url, status, meta_json, now, now),
+            )
 
     def get_documents_by_status(self, status: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Fetch documents with a given status."""
@@ -258,13 +288,25 @@ class RegDocsDB:
         rows = self.conn.execute(query, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
-    def get_pending_downloads(self, max_retries: int = 3) -> List[Dict[str, Any]]:
-        """Get documents ready for download: NEW + FAILED with retries remaining."""
+    def get_pending_downloads(self, max_retries: int = 3, include_html: bool = False) -> List[Dict[str, Any]]:
+        """Get documents ready for download: NEW file items + FAILED with retries remaining.
+
+        Filters out non-file items (Compound Documents, Folders) and optionally
+        HTML documents at the query level to avoid loading thousands of records
+        that would be skipped at runtime.
+        """
+        html_filter = ""
+        if not include_html:
+            html_filter = """AND json_extract(metadata, '$.kind') != 'Html Document'
+               AND COALESCE(json_extract(metadata, '$.extension'), '') != '.html'"""
+
         rows = self.conn.execute(
-            """
+            f"""
             SELECT * FROM documents
-            WHERE status = 'NEW'
-               OR (status = 'FAILED' AND file_path IS NULL AND retry_count < ?)
+            WHERE (
+                (status = 'NEW' AND json_extract(metadata, '$.is_file') = 1 {html_filter})
+                OR (status = 'FAILED' AND file_path IS NULL AND retry_count < ?)
+            )
             ORDER BY retry_count ASC, created_at ASC
             """,
             (max_retries,),
@@ -609,20 +651,56 @@ class RegDocsDB:
         """Search the FTS5 index and return matching document IDs ranked by relevance.
 
         Args:
-            query: Search query string (supports FTS5 syntax).
+            query: Search query string. Special FTS5 characters are escaped
+                   automatically so user input won't cause syntax errors.
             limit: Maximum number of results to return.
 
         Returns:
             List of document IDs ordered by relevance.
         """
-        # Escape special FTS5 characters for safety
-        # Use simple prefix matching: wrap each term for broad matching
+        # Sanitize query for FTS5: remove/escape characters that are FTS5 operators
+        # FTS5 operators: AND, OR, NOT, NEAR, parentheses, quotes, hyphens (column prefix), *, ^
+        sanitized = query
+
+        # Remove parentheses and other FTS5 syntax characters
+        sanitized = sanitized.replace("(", " ").replace(")", " ")
+        sanitized = sanitized.replace(":", " ").replace("^", " ")
+        sanitized = sanitized.replace("*", " ")
+
+        # Replace hyphens with spaces (hyphens mean column:term in FTS5)
+        sanitized = sanitized.replace("-", " ")
+
+        # Collapse multiple spaces
+        sanitized = " ".join(sanitized.split())
+
+        if not sanitized.strip():
+            return []
+
+        # Wrap each word as a prefix search term to avoid FTS5 keyword issues
+        # (AND, OR, NOT become regular search terms when quoted or used as prefix)
+        words = sanitized.split()
+        # Filter out FTS5 keywords and very short tokens
+        fts_keywords = {"AND", "OR", "NOT", "NEAR"}
+        terms = []
+        for w in words:
+            if w.upper() in fts_keywords:
+                # Treat as a literal by quoting it
+                terms.append(f'"{w}"')
+            elif len(w) >= 2:
+                terms.append(f"{w}*")
+            # Skip single-char tokens
+
+        if not terms:
+            return []
+
+        fts_query = " OR ".join(terms)
+
         rows = self.conn.execute(
             """SELECT doc_id, rank FROM documents_fts
                WHERE documents_fts MATCH ?
                ORDER BY rank
                LIMIT ?""",
-            (query, limit),
+            (fts_query, limit),
         ).fetchall()
         return [row["doc_id"] for row in rows]
 
