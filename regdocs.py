@@ -274,7 +274,7 @@ def parse_rows(html: str) -> List[Dict[str, Any]]:
             "url": f"{DOMAIN}{link_el['href']}",
             "is_file": href_match.group(1) == "File/Download",
             "date": tds[1].get_text(strip=True),
-            "submitter": tds[2].get_text(strip=True) or None,
+            "submitter": tds[2].get_text(strip=True) or "",
         }
 
         icon = cell.find("i", title=True)
@@ -1627,20 +1627,20 @@ def run_index(args) -> None:
                     "total_chunks": len(page_chunks),
                     "page_start": pchunk["page_start"],
                     "page_end": pchunk["page_end"],
-                    "company": metadata.get("company", ""),
-                    "company_id": str(metadata.get("company_id", "")),
-                    "project": metadata.get("project", ""),
-                    "project_id": str(metadata.get("project_id", "")),
-                    "filing_number": metadata.get("filing_number", ""),
-                    "date": metadata.get("date", ""),
-                    "submitter": metadata.get("submitter", ""),
-                    "kind": metadata.get("kind", ""),
-                    "is_file": metadata.get("is_file", False),
-                    "application_types": ", ".join(metadata.get("application_types", [])) if isinstance(metadata.get("application_types"), list) else metadata.get("application_types", ""),
-                    "document_types": ", ".join(metadata.get("document_types", [])) if isinstance(metadata.get("document_types"), list) else metadata.get("document_types", ""),
-                    "commodities": ", ".join(metadata.get("commodities", [])) if isinstance(metadata.get("commodities"), list) else metadata.get("commodities", ""),
-                    "roles": ", ".join(metadata.get("roles", [])) if isinstance(metadata.get("roles"), list) else metadata.get("roles", ""),
-                    "quality_score": metadata.get("quality_score", 1.0),
+                    "company": metadata.get("company") or "",
+                    "company_id": str(metadata.get("company_id") or ""),
+                    "project": metadata.get("project") or "",
+                    "project_id": str(metadata.get("project_id") or ""),
+                    "filing_number": metadata.get("filing_number") or "",
+                    "date": metadata.get("date") or "",
+                    "submitter": metadata.get("submitter") or "",
+                    "kind": metadata.get("kind") or "",
+                    "is_file": bool(metadata.get("is_file", False)),
+                    "application_types": ", ".join(metadata.get("application_types") or []) if isinstance(metadata.get("application_types"), list) else (metadata.get("application_types") or ""),
+                    "document_types": ", ".join(metadata.get("document_types") or []) if isinstance(metadata.get("document_types"), list) else (metadata.get("document_types") or ""),
+                    "commodities": ", ".join(metadata.get("commodities") or []) if isinstance(metadata.get("commodities"), list) else (metadata.get("commodities") or ""),
+                    "roles": ", ".join(metadata.get("roles") or []) if isinstance(metadata.get("roles"), list) else (metadata.get("roles") or ""),
+                    "quality_score": metadata.get("quality_score") or 1.0,
                 })
 
             # Document-level summary chunk (chunk_index=-1) for timeline/cross-doc queries.
@@ -1686,20 +1686,20 @@ def run_index(args) -> None:
                 "total_chunks": len(page_chunks),
                 "page_start": 0,
                 "page_end": 0,
-                "company": metadata.get("company", ""),
-                "company_id": str(metadata.get("company_id", "")),
-                "project": metadata.get("project", ""),
-                "project_id": str(metadata.get("project_id", "")),
-                "filing_number": metadata.get("filing_number", ""),
-                "date": metadata.get("date", ""),
-                "submitter": metadata.get("submitter", ""),
-                "kind": metadata.get("kind", ""),
-                "is_file": metadata.get("is_file", False),
-                "application_types": ", ".join(metadata.get("application_types", [])) if isinstance(metadata.get("application_types"), list) else metadata.get("application_types", ""),
-                "document_types": ", ".join(metadata.get("document_types", [])) if isinstance(metadata.get("document_types"), list) else metadata.get("document_types", ""),
-                "commodities": ", ".join(metadata.get("commodities", [])) if isinstance(metadata.get("commodities"), list) else metadata.get("commodities", ""),
-                "roles": ", ".join(metadata.get("roles", [])) if isinstance(metadata.get("roles"), list) else metadata.get("roles", ""),
-                "quality_score": metadata.get("quality_score", 1.0),
+                "company": metadata.get("company") or "",
+                "company_id": str(metadata.get("company_id") or ""),
+                "project": metadata.get("project") or "",
+                "project_id": str(metadata.get("project_id") or ""),
+                "filing_number": metadata.get("filing_number") or "",
+                "date": metadata.get("date") or "",
+                "submitter": metadata.get("submitter") or "",
+                "kind": metadata.get("kind") or "",
+                "is_file": bool(metadata.get("is_file", False)),
+                "application_types": ", ".join(metadata.get("application_types") or []) if isinstance(metadata.get("application_types"), list) else (metadata.get("application_types") or ""),
+                "document_types": ", ".join(metadata.get("document_types") or []) if isinstance(metadata.get("document_types"), list) else (metadata.get("document_types") or ""),
+                "commodities": ", ".join(metadata.get("commodities") or []) if isinstance(metadata.get("commodities"), list) else (metadata.get("commodities") or ""),
+                "roles": ", ".join(metadata.get("roles") or []) if isinstance(metadata.get("roles"), list) else (metadata.get("roles") or ""),
+                "quality_score": metadata.get("quality_score") or 1.0,
                 "is_summary": True,
             })
 
@@ -2729,9 +2729,14 @@ def run_compliance(args) -> None:
     """Detect filings with Orders but missing Compliance documents."""
     db = get_db(Path(args.db))
 
-    # Find all filings that have an 'Order' document type
+    # Only load documents that could have Orders or Compliance in their doc_types
     rows = db.conn.execute(
-        "SELECT id, name, metadata FROM documents WHERE metadata IS NOT NULL"
+        """SELECT id, name, metadata FROM documents
+           WHERE metadata IS NOT NULL
+             AND json_extract(metadata, '$.filing_number') IS NOT NULL
+             AND json_extract(metadata, '$.filing_number') != ''
+             AND (json_extract(metadata, '$.document_types') LIKE '%Order%'
+               OR json_extract(metadata, '$.document_types') LIKE '%Compliance%')"""
     ).fetchall()
 
     filings: Dict[str, List[Dict[str, Any]]] = {}
