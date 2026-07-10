@@ -706,6 +706,9 @@ async def download_one(
                                              duration_ms=(time.monotonic() - t0) * 1000,
                                              error_type=f"http_{response.status_code}")
                             counters["errors"] += 1
+                            # Clean up any partial file written before the status was checked
+                            if save_path and save_path.exists():
+                                save_path.unlink()
                             return
 
                 except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as e:
@@ -2941,12 +2944,17 @@ async def run_all(args) -> None:
         logging.info("=" * 60)
         await run_download(args)
 
+        # Convert stage uses a different output directory (markdown/ not downloads/)
+        download_dir = args.output_dir
+        args.output_dir = "markdown"
+
         logging.info("=" * 60)
         logging.info("STAGE 3: Convert")
         logging.info("=" * 60)
         await run_convert(args)
 
-        # Index stage reads args.force
+        # Restore output_dir and set force for index
+        args.output_dir = download_dir
         args.force = getattr(args, 'force_index', False)
 
         logging.info("=" * 60)
@@ -3009,8 +3017,29 @@ async def run_watch(args) -> None:
         args.chunk_size = CHUNK_SIZE
     if not hasattr(args, 'overlap'):
         args.overlap = CHUNK_OVERLAP
+    if not hasattr(args, 'min_quality'):
+        args.min_quality = 0.0
+    if not hasattr(args, 'timeout'):
+        args.timeout = 300
 
-    await run_all(args)
+    # run_all passes args through to each stage. Download and convert both
+    # read args.output_dir but expect different directories. We stash the
+    # download dir, then swap in the convert dir before that stage runs.
+    # Alternatively, run stages directly here for clarity.
+    await run_scout(args)
+
+    # Download stage uses args.output_dir = downloads/
+    args.force = False
+    await run_download(args)
+
+    # Convert stage uses args.output_dir = markdown/
+    args.output_dir = "markdown"
+    await run_convert(args)
+
+    # Index stage
+    run_index(args)
+
+    run_stats(args)
 
 
 # ===========================================================================

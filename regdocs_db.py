@@ -603,49 +603,57 @@ class RegDocsDB:
 
         Drops all existing FTS content and re-populates from documents.
         Call this after indexing to keep keyword search in sync.
+        Wrapped in a transaction so a crash mid-rebuild doesn't leave FTS empty.
         """
-        # Clear existing FTS content
-        self.conn.execute("DELETE FROM documents_fts")
+        self.conn.execute("BEGIN")
+        try:
+            # Clear existing FTS content
+            self.conn.execute("DELETE FROM documents_fts")
 
-        # Populate from documents table
-        rows = self.conn.execute(
-            "SELECT id, name, metadata FROM documents WHERE metadata IS NOT NULL"
-        ).fetchall()
+            # Populate from documents table
+            rows = self.conn.execute(
+                "SELECT id, name, metadata FROM documents WHERE metadata IS NOT NULL"
+            ).fetchall()
 
-        for row in rows:
-            doc_id = row["id"]
-            name = row["name"] or ""
-            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            for row in rows:
+                doc_id = row["id"]
+                name = row["name"] or ""
+                meta = json.loads(row["metadata"]) if row["metadata"] else {}
 
-            company = meta.get("company", "") or ""
-            project = meta.get("project", "") or ""
-            filing_number = meta.get("filing_number", "") or ""
-            submitter = meta.get("submitter", "") or ""
-            snippet = meta.get("snippet", "") or ""
+                company = meta.get("company", "") or ""
+                project = meta.get("project", "") or ""
+                filing_number = meta.get("filing_number", "") or ""
+                submitter = meta.get("submitter", "") or ""
+                snippet = meta.get("snippet", "") or ""
 
-            document_types = meta.get("document_types", [])
-            if isinstance(document_types, list):
-                document_types = ", ".join(document_types)
+                document_types = meta.get("document_types", [])
+                if isinstance(document_types, list):
+                    document_types = ", ".join(document_types)
 
-            application_types = meta.get("application_types", [])
-            if isinstance(application_types, list):
-                application_types = ", ".join(application_types)
+                application_types = meta.get("application_types", [])
+                if isinstance(application_types, list):
+                    application_types = ", ".join(application_types)
 
-            commodities = meta.get("commodities", [])
-            if isinstance(commodities, list):
-                commodities = ", ".join(commodities)
+                commodities = meta.get("commodities", [])
+                if isinstance(commodities, list):
+                    commodities = ", ".join(commodities)
 
-            roles = meta.get("roles", [])
-            if isinstance(roles, list):
-                roles = ", ".join(roles)
+                roles = meta.get("roles", [])
+                if isinstance(roles, list):
+                    roles = ", ".join(roles)
 
-            self.conn.execute(
-                """INSERT INTO documents_fts (doc_id, name, company, project, filing_number,
-                   submitter, snippet, document_types, application_types, commodities, roles)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (doc_id, name, company, project, filing_number,
-                 submitter, snippet, document_types, application_types, commodities, roles),
-            )
+                self.conn.execute(
+                    """INSERT INTO documents_fts (doc_id, name, company, project, filing_number,
+                       submitter, snippet, document_types, application_types, commodities, roles)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (doc_id, name, company, project, filing_number,
+                     submitter, snippet, document_types, application_types, commodities, roles),
+                )
+
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
 
     def search_fts(self, query: str, limit: int = 20) -> List[str]:
         """Search the FTS5 index and return matching document IDs ranked by relevance.
