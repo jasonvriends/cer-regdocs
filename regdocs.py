@@ -419,7 +419,7 @@ async def run_scout(args) -> None:
     started_at = datetime.now(timezone.utc)
     t0_monotonic = time.monotonic()
     date_params = {"sd": config.start_date, "ed": config.end_date}
-    limiter = TokenBucketLimiter(rate=1.0 / config.min_delay, burst=config.concurrency)
+    limiter = TokenBucketLimiter(rate=1.0 / max(config.min_delay, 0.1), burst=config.concurrency)
 
     logging.info(f"Crawling {config.start_date} to {config.end_date} "
                  f"(page size {config.page_size}, parser {SOUP_PARSER})")
@@ -773,7 +773,7 @@ async def run_download(args) -> None:
         "include_html": config.include_html,
     })
 
-    limiter = TokenBucketLimiter(rate=1.0 / config.min_delay, burst=config.concurrency)
+    limiter = TokenBucketLimiter(rate=1.0 / max(config.min_delay, 0.1), burst=config.concurrency)
     semaphore = asyncio.Semaphore(config.concurrency)
     existing_by_stem = {p.stem: p for p in config.output_dir.iterdir() if p.is_file()}
     counters = {"downloaded": 0, "already": 0, "skipped": 0, "skipped_html": 0, "errors": 0}
