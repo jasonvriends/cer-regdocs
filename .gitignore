@@ -1,0 +1,29 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Pipeline database — regenerate with `python regdocs.py`
+# (contains public regulatory metadata; keep out of the repo)
+regdocs.db
+regdocs.db-wal
+regdocs.db-shm
+
+# Vector database — regenerate with `python regdocs.py index`
+chroma_db/
+
+# Pipeline output directories
+output/
+downloads/
+markdown/
+*.jsonl
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local scratch scripts
+test_*
+meow.sh
