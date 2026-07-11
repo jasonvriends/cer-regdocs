@@ -923,145 +923,152 @@ def compute_quality_score(text: str) -> float:
     return round(min(1.0, max(0.0, score)), 3)
 
 
-async def convert_one(
-    converter: Any,
+async def convert_one_subprocess(
     record: Dict[str, Any],
     output_dir: Path,
     db: Any,
-    semaphore: asyncio.Semaphore,
     progress: tqdm,
     counters: Dict[str, int],
     timeout: int = 300,
 ) -> None:
-    """Convert a single document to Markdown."""
-    async with semaphore:
-        doc_id = record["id"]
-        file_path = record.get("file_path")
-        name = record.get("name", "unknown")
-        slug_name = slugify(name)
+    """Convert a single document by spawning convert_worker.py as a subprocess.
+
+    This isolates Docling's native code (which can segfault on certain PDFs)
+    in a child process. If the child crashes, the parent logs the failure and
+    moves on to the next document.
+    """
+    doc_id = record["id"]
+    file_path = record.get("file_path")
+    name = record.get("name", "unknown")
+    slug_name = slugify(name)
+
+    try:
+        if not file_path or not Path(file_path).exists():
+            db.mark_failed(doc_id, f"File not found: {file_path}", "convert")
+            db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
+                             error_type="file_not_found")
+            counters["errors"] += 1
+            return
+
+        doc_path = Path(file_path)
+        ext = doc_path.suffix.lower()
+        if ext not in CONVERTIBLE_EXTENSIONS:
+            counters["skipped"] += 1
+            return
+
+        markdown_path = output_dir / f"{doc_id}_{slug_name}.md"
+
+        # Idempotency: skip if already converted (any non-empty file)
+        if markdown_path.exists() and markdown_path.stat().st_size > 0:
+            counters["already"] += 1
+            return
+
+        t0 = time.monotonic()
+
+        # Build subprocess command
+        worker_script = Path(__file__).parent / "convert_worker.py"
+        cmd = [sys.executable, str(worker_script), str(doc_path), str(markdown_path)]
+        if ext in (".html", ".htm"):
+            cmd.append("--html-preprocess")
 
         try:
-            if not file_path or not Path(file_path).exists():
-                db.mark_failed(doc_id, f"File not found: {file_path}", "convert")
-                db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
-                                 error_type="file_not_found")
-                counters["errors"] += 1
-                return
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
 
-            doc_path = Path(file_path)
-            ext = doc_path.suffix.lower()
-            if ext not in CONVERTIBLE_EXTENSIONS:
-                counters["skipped"] += 1
-                return
-
-            markdown_path = output_dir / f"{doc_id}_{slug_name}.md"
-
-            # Idempotency: skip if already converted (any non-empty file)
-            if markdown_path.exists() and markdown_path.stat().st_size > 0:
-                counters["already"] += 1
-                return
-
-            t0 = time.monotonic()
-            loop = asyncio.get_running_loop()
-            preprocessed_path: Optional[Path] = None
-
+        except asyncio.TimeoutError:
+            # Kill the subprocess if it timed out
             try:
-                convert_path = doc_path
-                if ext in (".html", ".htm"):
-                    preprocessed_path = markdown_path.with_suffix(".preprocessed.html")
-                    preprocess_html(doc_path, preprocessed_path)
-                    convert_path = preprocessed_path
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            duration_ms = (time.monotonic() - t0) * 1000
+            db.mark_failed(doc_id, f"Timeout after {timeout}s", "convert")
+            db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
+                             duration_ms=duration_ms, error_type="timeout")
+            counters["errors"] += 1
+            logging.warning(f"Timeout ({timeout}s): {doc_path.name}")
+            return
 
-                result = await asyncio.wait_for(
-                    loop.run_in_executor(None, converter.convert, convert_path),
-                    timeout=timeout,
-                )
+        duration_ms = (time.monotonic() - t0) * 1000
+        returncode = proc.returncode
 
-                # Build page-annotated markdown using Docling provenance
-                doc_obj = result.document
-                current_page = None
-                parts: List[str] = []
-                try:
-                    for item, _level in doc_obj.iterate_items():
-                        if hasattr(item, 'prov') and item.prov:
-                            page = item.prov[0].page_no
-                            if page != current_page:
-                                parts.append(f"\n<!-- page:{page} -->")
-                                current_page = page
-                        md = item.export_to_markdown()
-                        if md and md.strip():
-                            parts.append(md)
-                    markdown_content = "\n\n".join(parts)
-                except Exception:
-                    # Fallback to flat export if iterate_items fails
-                    markdown_content = doc_obj.export_to_markdown()
+        # Segfault: returncode is -11 (SIGSEGV) on Linux
+        if returncode is not None and returncode < 0:
+            import signal as _signal
+            sig_name = "unknown signal"
+            try:
+                sig_name = _signal.Signals(-returncode).name
+            except (ValueError, AttributeError):
+                sig_name = f"signal {-returncode}"
+            error_msg = f"Worker killed by {sig_name} (exit code {returncode})"
+            db.mark_failed(doc_id, error_msg, "convert")
+            db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
+                             duration_ms=duration_ms, error_type="crash", detail=error_msg)
+            counters["errors"] += 1
+            logging.error(f"CRASH ({sig_name}): {doc_path.name}")
+            return
 
-                # Compute quality score for RAG prioritization
-                quality_score = compute_quality_score(markdown_content)
+        # Parse JSON result from stdout
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        if returncode == 0 and stdout_text:
+            try:
+                result = json.loads(stdout_text)
+                if result.get("success"):
+                    quality_score = result.get("quality_score", 0.0)
+                    db.mark_converted(doc_id, str(markdown_path), quality_score=quality_score)
+                    db.record_metric("convert", "convert_file", document_id=doc_id, success=True,
+                                     duration_ms=duration_ms,
+                                     detail=f"{markdown_path.name} quality={quality_score:.3f}")
+                    counters["converted"] += 1
+                    logging.info(f"Converted: {markdown_path.name} (quality={quality_score:.2f}, {duration_ms/1000:.1f}s)")
+                    return
+            except json.JSONDecodeError:
+                pass
 
-                # Atomic write
-                tmp_path = markdown_path.with_suffix(".tmp")
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    f.write(markdown_content)
-                tmp_path.replace(markdown_path)
+        # Worker returned non-zero or unparseable output
+        error_msg = "Unknown error"
+        error_type = "worker_error"
+        if stdout_text:
+            try:
+                result = json.loads(stdout_text)
+                error_msg = result.get("error", "Unknown error")
+                error_type = result.get("error_type", "worker_error")
+            except json.JSONDecodeError:
+                error_msg = f"Worker exit code {returncode}"
+        else:
+            # No stdout — check stderr for clues
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            last_lines = stderr_text.split("\n")[-3:] if stderr_text else []
+            error_msg = f"Worker exit code {returncode}: {' | '.join(last_lines)}"[:500]
 
-                duration_ms = (time.monotonic() - t0) * 1000
-                db.mark_converted(doc_id, str(markdown_path), quality_score=quality_score)
-                db.record_metric("convert", "convert_file", document_id=doc_id, success=True,
-                                 duration_ms=duration_ms, detail=f"{markdown_path.name} quality={quality_score:.3f}")
-                counters["converted"] += 1
-                logging.info(f"Converted: {markdown_path.name} (quality={quality_score:.2f})")
+        db.mark_failed(doc_id, error_msg, "convert")
+        db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
+                         duration_ms=duration_ms, error_type=error_type, detail=error_msg[:200])
+        counters["errors"] += 1
+        logging.error(f"Failed: {doc_path.name}: {error_msg[:100]}")
 
-            except asyncio.TimeoutError:
-                duration_ms = (time.monotonic() - t0) * 1000
-                db.mark_failed(doc_id, f"Timeout after {timeout}s", "convert")
-                db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
-                                 duration_ms=duration_ms, error_type="timeout")
-                counters["errors"] += 1
-
-            except Exception as e:
-                duration_ms = (time.monotonic() - t0) * 1000
-                db.mark_failed(doc_id, str(e), "convert")
-                db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
-                                 duration_ms=duration_ms, error_type=type(e).__name__, detail=str(e))
-                counters["errors"] += 1
-                logging.error(f"Failed to convert {doc_path.name}: {e}")
-
-            finally:
-                if preprocessed_path and preprocessed_path.exists():
-                    preprocessed_path.unlink()
-                # Free GPU memory if available
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except ImportError:
-                    pass
-
-        finally:
-            progress.update(1)
+    finally:
+        progress.update(1)
 
 
 async def run_convert(args) -> None:
-    """Execute the convert stage."""
+    """Execute the convert stage.
+
+    Each document is converted in a separate subprocess (convert_worker.py)
+    so that segfaults in Docling's native PDF code cannot crash the pipeline.
+    """
     db_path = Path(args.db)
     output_dir = Path(args.output_dir)
-    concurrency = max(1, args.concurrency)
     max_retries = getattr(args, 'max_retries', 3)
-
-    # Docling's converter is NOT thread-safe (uses GPU models internally).
-    # Force concurrency=1 to prevent CUDA/model corruption.
-    if concurrency > 1:
-        logging.warning(
-            f"Convert concurrency capped at 1 (requested {concurrency}). "
-            "Docling's PDF converter is not thread-safe."
-        )
-        concurrency = 1
 
     db = get_db(db_path)
 
     # Filter non-convertible extensions at the SQL level
-    # Only fetch documents whose file_path ends with a convertible extension
     ext_conditions = " OR ".join(f"file_path LIKE '%{ext}'" for ext in CONVERTIBLE_EXTENSIONS)
     records = db.conn.execute(
         f"""SELECT * FROM documents
@@ -1095,24 +1102,31 @@ async def run_convert(args) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = db.start_run("converter", {
         "output_dir": str(output_dir),
-        "concurrency": concurrency,
     })
 
-    # Initialize converter (heavy — imports torch, loads models)
-    logging.info("Initializing Docling converter (this may take a moment)...")
-    converter = get_converter()
-
-    semaphore = asyncio.Semaphore(concurrency)
     counters = {"converted": 0, "already": 0, "skipped": 0, "errors": 0}
 
     try:
         with tqdm(total=len(records), desc="Converting", unit=" file") as pbar:
-            tasks = [
-                convert_one(converter, rec, output_dir, db, semaphore, pbar, counters,
-                            timeout=getattr(args, 'timeout', 300))
-                for rec in records
-            ]
-            await asyncio.gather(*tasks)
+            for rec in records:
+                try:
+                    await convert_one_subprocess(
+                        rec, output_dir, db, pbar, counters,
+                        timeout=getattr(args, 'timeout', 300),
+                    )
+                except KeyboardInterrupt:
+                    logging.info("Interrupted by user — stopping conversion.")
+                    break
+                except Exception as e:
+                    doc_id = rec.get("id", "?")
+                    logging.error(f"Unexpected error on doc {doc_id}: {type(e).__name__}: {e}")
+                    try:
+                        db.mark_failed(str(doc_id), f"{type(e).__name__}: {e}", "convert")
+                    except Exception:
+                        pass
+                    counters["errors"] += 1
+                    pbar.update(1)
+                    continue
     finally:
         db.finish_run(run_id, counters)
         db.close()
@@ -3126,12 +3140,10 @@ def build_parser() -> argparse.ArgumentParser:
     conv_p = subparsers.add_parser("convert", help="Convert downloaded files to Markdown",
                                    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     conv_p.add_argument("--output-dir", default="markdown", help="Directory to save Markdown files")
-    conv_p.add_argument("--concurrency", type=int, default=1,
-                        help="Max parallel conversions")
     conv_p.add_argument("--max-retries", type=int, default=3,
                         help="Max retry attempts for failed conversions")
-    conv_p.add_argument("--timeout", type=int, default=300,
-                        help="Timeout per document in seconds (default: 300s = 5 min)")
+    conv_p.add_argument("--timeout", type=int, default=600,
+                        help="Timeout per document in seconds (default: 600s = 10 min)")
     conv_p.add_argument("--dry-run", action="store_true", help="Show what would be converted without converting")
 
     # --- all ---
