@@ -871,8 +871,6 @@ async def convert_one_subprocess(
     """
     doc_id = record["id"]
     file_path = record.get("file_path")
-    name = record.get("name", "unknown")
-    slug_name = slugify(name)
 
     try:
         if not file_path or not Path(file_path).exists():
@@ -888,7 +886,11 @@ async def convert_one_subprocess(
             counters["skipped"] += 1
             return
 
-        markdown_path = output_dir / f"{doc_id}_{slug_name}.md"
+        # Output files are named by document ID only. The human-readable name
+        # lives in the DB (documents.name); ID-only names stay well under
+        # filesystem limits, which very long CER document titles can exceed
+        # once sidecar suffixes (.docling.json.gz) are appended.
+        markdown_path = output_dir / f"{doc_id}.md"
 
         # Idempotency: the markdown already exists — e.g., a previous run wrote
         # it but was interrupted before the DB update. Reconcile the DB here,

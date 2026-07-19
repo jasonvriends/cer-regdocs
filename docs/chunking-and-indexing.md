@@ -68,6 +68,21 @@ Trans Mountain Pipeline ULC hereby applies under section 52...
 The following conditions are imposed...
 ```
 
+### Output Files
+
+Converted output is named by document ID only — `markdown/4642847.md`, `4642847.bbox.json`,
+`4642847.docling.json.gz` — because CER document titles can exceed filesystem name limits and
+the human-readable name already lives in the database (`documents.name`, shown in all citations).
+To look up a name from an ID: `SELECT name FROM documents WHERE id='4642847'` or
+`python regdocs.py export`. The ID is also the REGDOCS URL:
+`https://apps.cer-rec.gc.ca/REGDOCS/Item/View/<id>`.
+
+Three files per PDF, each with a distinct job:
+- `.md` — what `index`/`verify`/`pcmr` read; grep-friendly
+- `.bbox.json` — read at ask-time to resolve citations to page regions; kept unzipped for speed
+- `.docling.json.gz` — cold-storage lossless export; nothing reads it in normal operation, but
+  future re-chunking/table-extraction can regenerate everything from it on CPU
+
 ### Bounding-Box Sidecar
 
 Alongside each Markdown file, the converter writes `<name>.bbox.json` capturing Docling's full
