@@ -858,20 +858,145 @@ def compute_quality_score(text: str) -> float:
     return round(min(1.0, max(0.0, score)), 3)
 
 
-async def convert_one_subprocess(
+RESULT_PREFIX = "RESULT "  # must match convert_worker.py
+WORKER_RECYCLE_DOCS = 500  # restart the worker periodically to bound memory growth
+
+
+class BatchConvertWorker:
+    """Manages a long-lived convert_worker.py --batch subprocess.
+
+    Models load once per worker process instead of once per document (which
+    would otherwise dominate runtime ~10:1 for small documents). Segfault
+    isolation is preserved: if the worker dies, the parent marks the current
+    document failed, respawns the worker, and continues.
+    """
+
+    def __init__(self, startup_timeout: int = 300):
+        self.proc = None
+        self.startup_timeout = startup_timeout
+        self.docs_converted = 0
+
+    async def start(self) -> None:
+        worker_script = Path(__file__).parent / "convert_worker.py"
+        self.proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(worker_script), "--batch",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        self.docs_converted = 0
+        # Wait for the ready line (model loading)
+        ready = await self._read_result(self.startup_timeout)
+        if not ready or not ready.get("ready"):
+            raise RuntimeError("Batch worker failed to initialize")
+
+    async def stop(self) -> None:
+        if self.proc is None:
+            return
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+            self.proc.kill()
+            await self.proc.wait()
+        except Exception:
+            pass
+        self.proc = None
+
+    async def restart(self) -> None:
+        await self.stop()
+        await self.start()
+
+    async def settle(self) -> None:
+        """Give a dead process a moment to be reaped so returncode is accurate.
+
+        After a SIGKILL/segfault, stdout EOF arrives before the exit status is
+        collected; without this, a crash gets misclassified as a timeout.
+        """
+        if self.proc is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(self.proc.wait()), timeout=2)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+    async def _read_result(self, timeout: float) -> Optional[Dict[str, Any]]:
+        """Read lines until a RESULT line appears; None on timeout/EOF."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                line = await asyncio.wait_for(self.proc.stdout.readline(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
+            if not line:  # EOF — worker died
+                return None
+            text = line.decode("utf-8", errors="replace").strip()
+            if text.startswith(RESULT_PREFIX):
+                try:
+                    return json.loads(text[len(RESULT_PREFIX):])
+                except json.JSONDecodeError:
+                    return None
+            # Ignore stray stdout noise from native libraries
+
+    async def convert(self, input_path: Path, output_path: Path,
+                      html_preprocess: bool, timeout: float) -> Optional[Dict[str, Any]]:
+        """Convert one document; None means timeout or worker crash."""
+        req = json.dumps({
+            "input": str(input_path),
+            "output": str(output_path),
+            "html_preprocess": html_preprocess,
+        })
+        try:
+            self.proc.stdin.write((req + "\n").encode("utf-8"))
+            await self.proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            return None
+        result = await self._read_result(timeout)
+        if result is not None:
+            self.docs_converted += 1
+        return result
+
+    @property
+    def crashed(self) -> bool:
+        return self.proc is None or self.proc.returncode is not None
+
+    @property
+    def exit_description(self) -> str:
+        if self.proc is None or self.proc.returncode is None:
+            return "unknown"
+        rc = self.proc.returncode
+        if rc < 0:
+            import signal as _signal
+            try:
+                return f"killed by {_signal.Signals(-rc).name}"
+            except (ValueError, AttributeError):
+                return f"killed by signal {-rc}"
+        return f"exit code {rc}"
+
+
+def _effective_timeout(file_path: Path, base_timeout: int) -> float:
+    """Scale the per-document timeout with file size (large scanned PDFs need
+    far longer than the base), bounded to keep pathological files from
+    stalling the run."""
+    try:
+        size_mb = file_path.stat().st_size / (1024 * 1024)
+    except OSError:
+        return base_timeout
+    return max(base_timeout, min(1800.0, size_mb * 60.0))
+
+
+async def convert_one_batch(
     record: Dict[str, Any],
     output_dir: Path,
     db: Any,
     progress: tqdm,
     counters: Dict[str, int],
+    worker: BatchConvertWorker,
     timeout: int = 300,
 ) -> None:
-    """Convert a single document by spawning convert_worker.py as a subprocess.
-
-    This isolates Docling's native code (which can segfault on certain PDFs)
-    in a child process. If the child crashes, the parent logs the failure and
-    moves on to the next document.
-    """
+    """Convert a single document via the persistent batch worker."""
     doc_id = record["id"]
     file_path = record.get("file_path")
 
@@ -901,105 +1026,69 @@ async def convert_one_subprocess(
         # every run without ever being marked CONVERTED.
         if markdown_path.exists() and markdown_path.stat().st_size > 0:
             text = markdown_path.read_text(encoding="utf-8", errors="replace")
-            quality = compute_quality_score(PAGE_MARKER_RE.sub("", text))
-            db.mark_converted(doc_id, str(markdown_path), quality_score=quality)
+            clean = PAGE_MARKER_RE.sub("", text)
+            from convert_worker import detect_language
+            pages = [int(p) for p in PAGE_MARKER_RE.findall(text)]
+            meta_update = {"language": detect_language(clean)}
+            if pages:
+                meta_update["page_count"] = max(pages)
+            db.mark_converted(doc_id, str(markdown_path),
+                              quality_score=compute_quality_score(clean),
+                              metadata_update=meta_update)
             counters["already"] += 1
             return
 
         t0 = time.monotonic()
+        eff_timeout = _effective_timeout(doc_path, timeout)
 
-        # Build subprocess command
-        worker_script = Path(__file__).parent / "convert_worker.py"
-        cmd = [sys.executable, str(worker_script), str(doc_path), str(markdown_path)]
-        if ext in (".html", ".htm"):
-            cmd.append("--html-preprocess")
+        # Recycle the worker periodically to bound memory growth
+        if worker.docs_converted >= WORKER_RECYCLE_DOCS:
+            logging.info(f"Recycling batch worker after {worker.docs_converted} documents")
+            await worker.restart()
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-
-        except asyncio.TimeoutError:
-            # Kill the subprocess if it timed out
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
-            duration_ms = (time.monotonic() - t0) * 1000
-            db.mark_failed(doc_id, f"Timeout after {timeout}s", "convert")
-            db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
-                             duration_ms=duration_ms, error_type="timeout")
-            counters["errors"] += 1
-            logging.warning(f"Timeout ({timeout}s): {doc_path.name}")
-            return
-
+        result = await worker.convert(doc_path, markdown_path, ext in (".html", ".htm"), eff_timeout)
         duration_ms = (time.monotonic() - t0) * 1000
-        returncode = proc.returncode
 
-        # Segfault: returncode is -11 (SIGSEGV) on Linux
-        if returncode is not None and returncode < 0:
-            import signal as _signal
-            sig_name = "unknown signal"
-            try:
-                sig_name = _signal.Signals(-returncode).name
-            except (ValueError, AttributeError):
-                sig_name = f"signal {-returncode}"
-            error_msg = f"Worker killed by {sig_name} (exit code {returncode})"
+        if result is None:
+            # Timeout or crash — distinguish for the error record, then respawn
+            await worker.settle()
+            if worker.crashed:
+                error_msg = f"Worker {worker.exit_description}"
+                error_type = "crash"
+                logging.error(f"CRASH ({worker.exit_description}): {doc_path.name}")
+            else:
+                error_msg = f"Timeout after {eff_timeout:.0f}s"
+                error_type = "timeout"
+                logging.warning(f"Timeout ({eff_timeout:.0f}s): {doc_path.name}")
             db.mark_failed(doc_id, error_msg, "convert")
             db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
-                             duration_ms=duration_ms, error_type="crash", detail=error_msg)
+                             duration_ms=duration_ms, error_type=error_type, detail=error_msg)
             counters["errors"] += 1
-            logging.error(f"CRASH ({sig_name}): {doc_path.name}")
+            await worker.restart()
             return
 
-        # Parse JSON result from stdout
-        stdout_text = stdout.decode("utf-8", errors="replace").strip()
-        if returncode == 0 and stdout_text:
-            try:
-                result = json.loads(stdout_text)
-                if result.get("success"):
-                    quality_score = result.get("quality_score", 0.0)
-                    meta_update = {}
-                    if result.get("page_count"):
-                        meta_update["page_count"] = result["page_count"]
-                    if result.get("language"):
-                        meta_update["language"] = result["language"]
-                    db.mark_converted(doc_id, str(markdown_path), quality_score=quality_score,
-                                      metadata_update=meta_update or None)
-                    db.record_metric("convert", "convert_file", document_id=doc_id, success=True,
-                                     duration_ms=duration_ms,
-                                     detail=f"{markdown_path.name} quality={quality_score:.3f}")
-                    counters["converted"] += 1
-                    logging.info(f"Converted: {markdown_path.name} (quality={quality_score:.2f}, {duration_ms/1000:.1f}s)")
-                    return
-            except json.JSONDecodeError:
-                pass
-
-        # Worker returned non-zero or unparseable output
-        error_msg = "Unknown error"
-        error_type = "worker_error"
-        if stdout_text:
-            try:
-                result = json.loads(stdout_text)
-                error_msg = result.get("error", "Unknown error")
-                error_type = result.get("error_type", "worker_error")
-            except json.JSONDecodeError:
-                error_msg = f"Worker exit code {returncode}"
+        if result.get("success"):
+            quality_score = result.get("quality_score", 0.0)
+            meta_update = {}
+            if result.get("page_count"):
+                meta_update["page_count"] = result["page_count"]
+            if result.get("language"):
+                meta_update["language"] = result["language"]
+            db.mark_converted(doc_id, str(markdown_path), quality_score=quality_score,
+                              metadata_update=meta_update or None)
+            db.record_metric("convert", "convert_file", document_id=doc_id, success=True,
+                             duration_ms=duration_ms,
+                             detail=f"{markdown_path.name} quality={quality_score:.3f}")
+            counters["converted"] += 1
+            logging.info(f"Converted: {markdown_path.name} (quality={quality_score:.2f}, {duration_ms/1000:.1f}s)")
         else:
-            # No stdout — check stderr for clues
-            stderr_text = stderr.decode("utf-8", errors="replace").strip()
-            last_lines = stderr_text.split("\n")[-3:] if stderr_text else []
-            error_msg = f"Worker exit code {returncode}: {' | '.join(last_lines)}"[:500]
-
-        db.mark_failed(doc_id, error_msg, "convert")
-        db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
-                         duration_ms=duration_ms, error_type=error_type, detail=error_msg[:200])
-        counters["errors"] += 1
-        logging.error(f"Failed: {doc_path.name}: {error_msg[:100]}")
+            error_msg = result.get("error", "Unknown error")
+            error_type = result.get("error_type", "worker_error")
+            db.mark_failed(doc_id, error_msg, "convert")
+            db.record_metric("convert", "convert_file", document_id=doc_id, success=False,
+                             duration_ms=duration_ms, error_type=error_type, detail=error_msg[:200])
+            counters["errors"] += 1
+            logging.error(f"Failed: {doc_path.name}: {error_msg[:100]}")
 
     finally:
         progress.update(1)
@@ -1059,12 +1148,17 @@ async def run_convert(args) -> None:
 
     counters = {"converted": 0, "already": 0, "skipped": 0, "errors": 0}
 
+    worker = BatchConvertWorker()
+    logging.info("Starting batch worker (loading models once)...")
+    await worker.start()
+
     try:
         with tqdm(total=len(records), desc="Converting", unit=" file") as pbar:
             for rec in records:
                 try:
-                    await convert_one_subprocess(
+                    await convert_one_batch(
                         rec, output_dir, db, pbar, counters,
+                        worker=worker,
                         timeout=getattr(args, 'timeout', 300),
                     )
                 except KeyboardInterrupt:
@@ -1079,8 +1173,11 @@ async def run_convert(args) -> None:
                         pass
                     counters["errors"] += 1
                     pbar.update(1)
+                    if worker.crashed:
+                        await worker.restart()
                     continue
     finally:
+        await worker.stop()
         db.finish_run(run_id, counters)
         db.close()
 

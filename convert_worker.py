@@ -74,7 +74,8 @@ def get_converter():
 
     def _safe_get_custom_logger(logger_name, level, stream=None):
         if stream is None:
-            stream = sys.stdout
+            # stderr, never stdout — stdout is the JSON protocol channel
+            stream = sys.stderr
         if not isinstance(level, (int, str)):
             level = logging.INFO
         return _original_get_custom_logger(logger_name, level, stream)
@@ -210,8 +211,13 @@ def build_bbox_sidecar(doc_obj) -> dict:
     return {"pages": pages, "items": items}
 
 
-def convert_document(input_path: Path, output_path: Path, html_preprocess: bool = False) -> dict:
-    """Convert a single document, return result dict."""
+def convert_document(input_path: Path, output_path: Path, html_preprocess: bool = False,
+                     converter=None) -> dict:
+    """Convert a single document, return result dict.
+
+    Pass a pre-initialized `converter` to reuse loaded models across documents
+    (batch mode) — model loading dominates per-document time otherwise.
+    """
     t0 = time.monotonic()
 
     preprocessed_path = None
@@ -225,8 +231,9 @@ def convert_document(input_path: Path, output_path: Path, html_preprocess: bool 
             preprocess_html(input_path, preprocessed_path)
             convert_path = preprocessed_path
 
-        logging.info(f"Initializing converter...")
-        converter = get_converter()
+        if converter is None:
+            logging.info(f"Initializing converter...")
+            converter = get_converter()
 
         logging.info(f"Converting: {input_path.name}")
         result = converter.convert(convert_path)
@@ -321,9 +328,55 @@ def convert_document(input_path: Path, output_path: Path, html_preprocess: bool 
             preprocessed_path.unlink()
 
 
+RESULT_PREFIX = "RESULT "  # sentinel so stray stdout noise can't corrupt the protocol
+
+
+def batch_main() -> None:
+    """Long-lived batch mode: initialize models once, then convert documents
+    streamed as JSON lines on stdin, emitting one RESULT line per document.
+
+    Request line:  {"input": "...", "output": "...", "html_preprocess": false}
+    Response line: RESULT {"success": true, ...}
+
+    The parent (regdocs.py) feeds documents one at a time and applies its own
+    per-document timeout; if this process segfaults, the parent respawns it.
+    """
+    logging.info("Batch worker starting — initializing converter once...")
+    converter = get_converter()
+    print(RESULT_PREFIX + json.dumps({"ready": True}), flush=True)
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError:
+            print(RESULT_PREFIX + json.dumps(
+                {"success": False, "error": "Bad request line", "error_type": "ProtocolError",
+                 "duration_ms": 0}), flush=True)
+            continue
+
+        input_path = Path(req["input"])
+        if not input_path.exists():
+            result = {"success": False, "error": f"File not found: {input_path}",
+                      "error_type": "FileNotFoundError", "duration_ms": 0}
+        else:
+            result = convert_document(
+                input_path, Path(req["output"]),
+                html_preprocess=bool(req.get("html_preprocess")),
+                converter=converter,
+            )
+        print(RESULT_PREFIX + json.dumps(result), flush=True)
+
+
 def main():
+    if "--batch" in sys.argv:
+        batch_main()
+        return
+
     if len(sys.argv) < 3:
-        print("Usage: python convert_worker.py <input_file> <output_md> [--html-preprocess]",
+        print("Usage: python convert_worker.py <input_file> <output_md> [--html-preprocess] | --batch",
               file=sys.stderr)
         sys.exit(2)
 
