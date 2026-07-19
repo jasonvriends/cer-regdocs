@@ -381,20 +381,33 @@ class RegDocsDB:
             )
         self.add_history(doc_id, "downloaded", DocumentStatus.DOWNLOADED, f"file_path={file_path}")
 
-    def mark_converted(self, doc_id: str, markdown_path: str, quality_score: float = None) -> None:
-        """Mark a document as successfully converted."""
+    def mark_converted(
+        self,
+        doc_id: str,
+        markdown_path: str,
+        quality_score: float = None,
+        metadata_update: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Mark a document as successfully converted.
+
+        metadata_update: extra convert-time fields to merge into metadata
+        (e.g., page_count, language).
+        """
         now = _now_iso()
         self.conn.execute(
             "UPDATE documents SET status = ?, markdown_path = ?, last_error = NULL, updated_at = ? WHERE id = ?",
             (DocumentStatus.CONVERTED, markdown_path, now, doc_id),
         )
-        # Store quality_score in metadata JSON
+        merged = dict(metadata_update or {})
         if quality_score is not None:
+            merged["quality_score"] = quality_score
+        if merged:
+            existing = self.get_document(doc_id)
+            existing_meta = json.loads(existing["metadata"]) if existing and existing.get("metadata") else {}
+            existing_meta.update(merged)
             self.conn.execute(
-                """UPDATE documents SET metadata = json_set(
-                    COALESCE(metadata, '{}'), '$.quality_score', ?
-                ) WHERE id = ?""",
-                (quality_score, doc_id),
+                "UPDATE documents SET metadata = ? WHERE id = ?",
+                (json.dumps(existing_meta, ensure_ascii=False), doc_id),
             )
         self.add_history(doc_id, "converted", DocumentStatus.CONVERTED, f"markdown_path={markdown_path} quality={quality_score}")
 

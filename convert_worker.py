@@ -14,9 +14,11 @@ Exit codes:
     2  — invalid arguments
 """
 
+import gzip
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -148,6 +150,32 @@ def compute_quality_score(text: str) -> float:
     return round(min(1.0, max(0.0, score)), 3)
 
 
+_EN_WORDS = {"the", "and", "of", "to", "in", "is", "for", "with", "that", "this"}
+_FR_WORDS = {"le", "la", "les", "de", "des", "et", "que", "pour", "dans", "une", "du", "au", "aux"}
+
+
+def detect_language(text: str) -> str:
+    """Cheap stopword-based language detection: 'en', 'fr', or 'mixed'.
+
+    CER filings are commonly submitted in both languages; tagging them lets
+    retrieval filter out the duplicate translation.
+    """
+    words = re.findall(r"[a-zàâçéèêëîïôûù]+", text.lower()[:40000])
+    if not words:
+        return "unknown"
+    en = sum(1 for w in words if w in _EN_WORDS)
+    fr = sum(1 for w in words if w in _FR_WORDS)
+    total = en + fr
+    if total < 10:
+        return "unknown"
+    ratio = en / total
+    if ratio >= 0.75:
+        return "en"
+    if ratio <= 0.25:
+        return "fr"
+    return "mixed"
+
+
 def build_bbox_sidecar(doc_obj) -> dict:
     """Collect per-item page/bounding-box provenance for click-to-highlight UI.
 
@@ -242,6 +270,22 @@ def convert_document(input_path: Path, output_path: Path, html_preprocess: bool 
             logging.warning(f"Bbox sidecar failed (non-fatal): {e}")
             bbox_path = None
 
+        # Lossless Docling document JSON (gzipped) — reconversion insurance.
+        # Preserves full table structure, provenance, and character spans so
+        # future re-chunking/re-export is a CPU job instead of a GPU re-run.
+        # Non-fatal on failure.
+        docjson_path = None
+        try:
+            doc_dict = doc_obj.export_to_dict()
+            docjson_path = output_path.with_suffix(".docling.json.gz")
+            docjson_tmp = docjson_path.with_suffix(".tmp")
+            with gzip.open(docjson_tmp, "wt", encoding="utf-8", compresslevel=6) as f:
+                json.dump(doc_dict, f, ensure_ascii=False)
+            docjson_tmp.replace(docjson_path)
+        except Exception as e:
+            logging.warning(f"Docling JSON export failed (non-fatal): {e}")
+            docjson_path = None
+
         # Atomic write
         tmp_path = output_path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -255,6 +299,9 @@ def convert_document(input_path: Path, output_path: Path, html_preprocess: bool 
             "success": True,
             "output_path": str(output_path),
             "bbox_path": str(bbox_path) if bbox_path else None,
+            "docjson_path": str(docjson_path) if docjson_path else None,
+            "page_count": len(getattr(doc_obj, "pages", {}) or {}),
+            "language": detect_language(markdown_content),
             "quality_score": quality_score,
             "duration_ms": duration_ms,
         }

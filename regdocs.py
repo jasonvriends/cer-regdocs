@@ -958,7 +958,13 @@ async def convert_one_subprocess(
                 result = json.loads(stdout_text)
                 if result.get("success"):
                     quality_score = result.get("quality_score", 0.0)
-                    db.mark_converted(doc_id, str(markdown_path), quality_score=quality_score)
+                    meta_update = {}
+                    if result.get("page_count"):
+                        meta_update["page_count"] = result["page_count"]
+                    if result.get("language"):
+                        meta_update["language"] = result["language"]
+                    db.mark_converted(doc_id, str(markdown_path), quality_score=quality_score,
+                                      metadata_update=meta_update or None)
                     db.record_metric("convert", "convert_file", document_id=doc_id, success=True,
                                      duration_ms=duration_ms,
                                      detail=f"{markdown_path.name} quality={quality_score:.3f}")
@@ -1017,6 +1023,10 @@ async def run_convert(args) -> None:
         (max_retries,),
     ).fetchall()
     records = [dict(row) for row in records]
+
+    limit = getattr(args, 'limit', None)
+    if limit:
+        records = records[:limit]
 
     logging.info(f"Found {len(records)} convertible documents")
 
@@ -1594,6 +1604,8 @@ def run_index(args) -> None:
                     "commodities": ", ".join(metadata.get("commodities") or []) if isinstance(metadata.get("commodities"), list) else (metadata.get("commodities") or ""),
                     "roles": ", ".join(metadata.get("roles") or []) if isinstance(metadata.get("roles"), list) else (metadata.get("roles") or ""),
                     "quality_score": metadata.get("quality_score") or 1.0,
+                    "language": metadata.get("language") or "",
+                    "page_count": metadata.get("page_count") or 0,
                 })
 
             # Document-level summary chunk (chunk_index=-1) for timeline/cross-doc queries.
@@ -1653,6 +1665,8 @@ def run_index(args) -> None:
                 "commodities": ", ".join(metadata.get("commodities") or []) if isinstance(metadata.get("commodities"), list) else (metadata.get("commodities") or ""),
                 "roles": ", ".join(metadata.get("roles") or []) if isinstance(metadata.get("roles"), list) else (metadata.get("roles") or ""),
                 "quality_score": metadata.get("quality_score") or 1.0,
+                "language": metadata.get("language") or "",
+                "page_count": metadata.get("page_count") or 0,
                 "is_summary": True,
             })
 
@@ -1956,6 +1970,8 @@ def run_ask(args) -> None:
         where_clauses.append({"date": {"$gte": args.after}})
     if hasattr(args, 'before') and args.before:
         where_clauses.append({"date": {"$lte": args.before}})
+    if getattr(args, 'language', None):
+        where_clauses.append({"language": args.language})
 
     # Substring filters via where_document
     doc_clauses = []
@@ -3597,6 +3613,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Max retry attempts for failed conversions")
     conv_p.add_argument("--timeout", type=int, default=600,
                         help="Timeout per document in seconds (default: 600s = 10 min)")
+    conv_p.add_argument("--limit", type=int, default=None,
+                        help="Convert at most N documents (useful for a test run)")
     conv_p.add_argument("--dry-run", action="store_true", help="Show what would be converted without converting")
 
     # --- all ---
@@ -3677,6 +3695,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Filter results by commodity (e.g., 'Oil', 'Natural Gas')")
     ask_p.add_argument("--document-type", type=str, default=None,
                        help="Filter results by document type (e.g., 'Application', 'Order')")
+    ask_p.add_argument("--language", type=str, default=None, choices=["en", "fr", "mixed", "unknown"],
+                       help="Filter by document language (CER filings are often duplicated in EN and FR)")
     ask_p.add_argument("--sort-by-date", action="store_true",
                        help="Sort retrieved chunks chronologically (useful for timeline queries)")
     ask_p.add_argument("--after", type=str, default=None,

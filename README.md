@@ -91,7 +91,7 @@ The web UI includes:
 |---------|-------------|
 | `scout` | Crawls REGDOCS for a date range, inserts documents with `status=NEW` |
 | `download` | Downloads files for all `NEW` documents, marks them `DOWNLOADED` |
-| `convert` | Converts `DOWNLOADED` files to Markdown via Docling (auto-detects GPU/CPU, OCR for English + French), marks `CONVERTED`. Also writes a `.bbox.json` sidecar per PDF with page/bounding-box provenance for future click-to-highlight viewing |
+| `convert` | Converts `DOWNLOADED` files to Markdown via Docling (auto-detects GPU/CPU, OCR for English + French), marks `CONVERTED`. Per PDF, also writes a `.bbox.json` sidecar (page/bounding-box provenance for click-to-highlight viewing) and a `.docling.json.gz` lossless export (full table structure + provenance — lets future re-chunking run on CPU instead of re-converting on GPU). Detects language (en/fr) and page count into metadata |
 | `index` | Chunks Markdown and embeds into ChromaDB using Ollama |
 | `ask` | Retrieves relevant chunks and answers via Ollama LLM |
 | `summarize` | Extracts structured data (conditions, dates, status) into a table |
@@ -310,6 +310,7 @@ python regdocs.py diff 4642847 4642848
 | `--concurrency` | `1` | Parallel conversions (capped at 1 — Docling is not thread-safe) |
 | `--max-retries` | `3` | Max retry attempts |
 | `--timeout` | `300` | Timeout per document in seconds (increase for large scanned PDFs) |
+| `--limit` | no limit | Convert at most N documents (useful for a test run) |
 | `--dry-run` | off | Show what would be converted |
 
 ### index
@@ -338,6 +339,7 @@ python regdocs.py diff 4642847 4642848
 | `--document-type` | none | Filter by document type (e.g., "Application", "Order") |
 | `--after` | none | Only include documents on or after this date (YYYY-MM-DD) |
 | `--before` | none | Only include documents on or before this date (YYYY-MM-DD) |
+| `--language` | none | Filter by document language: `en`, `fr`, `mixed` (CER filings are often duplicated in both) |
 | `--sort-by-date` | off | Sort results chronologically for timeline queries |
 | `--show-passages` | off | Show the most relevant text passages from matched documents |
 
