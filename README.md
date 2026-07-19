@@ -91,12 +91,14 @@ The web UI includes:
 |---------|-------------|
 | `scout` | Crawls REGDOCS for a date range, inserts documents with `status=NEW` |
 | `download` | Downloads files for all `NEW` documents, marks them `DOWNLOADED` |
-| `convert` | Converts `DOWNLOADED` files to Markdown via Docling (auto-detects GPU/CPU, OCR for English + French), marks `CONVERTED` |
+| `convert` | Converts `DOWNLOADED` files to Markdown via Docling (auto-detects GPU/CPU, OCR for English + French), marks `CONVERTED`. Also writes a `.bbox.json` sidecar per PDF with page/bounding-box provenance for future click-to-highlight viewing |
 | `index` | Chunks Markdown and embeds into ChromaDB using Ollama |
 | `ask` | Retrieves relevant chunks and answers via Ollama LLM |
 | `summarize` | Extracts structured data (conditions, dates, status) into a table |
 | `trends` | Analyzes filing duration patterns and estimates timelines from metadata |
 | `compliance` | Detects filings with Orders but no Compliance documents |
+| `pcmr` | Extracts findings from Post Construction Monitoring Reports (LLM) and reports trends |
+| `verify` | Cross-checks converted Markdown against the PDF text layer to catch extraction data loss |
 | `diff` | Compares two documents to identify changes (LLM-powered) |
 | `all` | Runs scout → download → convert → index in sequence |
 | `watch` | Cron-friendly: processes the last N days end-to-end |
@@ -243,6 +245,11 @@ python regdocs.py trends --application-type "CERA 183" --estimate
 # Compliance gaps: filings with orders but no compliance docs
 python regdocs.py compliance --company "Trans Mountain"
 
+# Post Construction Monitoring Report trends: compliance rate, issue categories, flagged companies
+python regdocs.py pcmr
+python regdocs.py pcmr --company "Trans Mountain" --after 2024-01-01
+python regdocs.py pcmr --csv > pcmr_findings.csv
+
 # Compare two documents
 python regdocs.py diff 4642847 4642848
 ```
@@ -355,6 +362,37 @@ python regdocs.py diff 4642847 4642848
 | `--application-type` | none | Filter by application type |
 | `--commodity` | none | Filter by commodity |
 | `--estimate` | off | Show duration estimate for a new filing matching these filters |
+
+### verify
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--sample` | all converted | Verify a random sample of N documents instead of all |
+| `--min-fidelity` | `0.95` | Flag documents whose numeric recall falls below this |
+| `--all` | off | List every flagged document (default shows worst 25) |
+
+Compares each converted Markdown against an independent extraction of the same PDF's text
+layer (pypdfium2, deterministic — cannot hallucinate). The fidelity score is the fraction of
+numeric values in the PDF that survived into the Markdown. Flagged documents show which
+numbers went missing so you can tell letterhead noise (harmless) from lost data (re-convert).
+Results are stored in each document's `metadata.verify`. Scanned PDFs have no text layer and
+are reported as unverifiable — for those, the OCR `quality_score` is the signal.
+
+### pcmr
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--document-type` | `Post Construction Monitoring Report` | Document type to match (substring) |
+| `--model` | `gemma4:26b` | Ollama LLM for structured extraction |
+| `--company` | none | Filter to a specific company |
+| `--after` / `--before` | none | Date range filter (YYYY-MM-DD) |
+| `--limit` | no limit | Analyze at most N reports (useful for a quick test) |
+| `--force` | off | Re-extract even if a cached analysis exists |
+| `--csv` | off | Output per-report findings as CSV instead of the trend report |
+
+Works directly off converted Markdown — no ChromaDB indexing required. Each report's extracted
+findings (compliance status, issue categories, resolved/unresolved items) are cached in its
+`metadata.pcmr_analysis`, keyed by content hash, so repeat runs only re-analyze new/changed reports.
 
 ### watch
 

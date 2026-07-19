@@ -802,74 +802,6 @@ async def run_download(args) -> None:
 # CONVERT (Processor) — Convert downloaded files to Markdown
 # ===========================================================================
 
-def preprocess_html(source_path: Path, target_path: Path) -> None:
-    """Replace image references in HTML with text equivalents."""
-    soup = BeautifulSoup(source_path.read_text(encoding="utf-8", errors="replace"), SOUP_PARSER)
-    for img in soup.find_all("img"):
-        src_name = Path(str(img.get("src", ""))).name.lower()
-        if src_name in ("yes.png", "checked.png"):
-            img.replace_with("☑")
-        elif src_name in ("no.png", "unchecked.png"):
-            img.replace_with("☐")
-        elif img.get("alt"):
-            img.replace_with(str(img["alt"]))
-        else:
-            img.decompose()
-    target_path.write_text(str(soup), encoding="utf-8")
-
-
-def get_converter():
-    """Initialize the Docling document converter with GPU support if available."""
-    # Late import — docling is heavy and only needed for convert
-    from docling.datamodel.base_models import InputFormat
-    from docling.document_converter import DocumentConverter, PdfFormatOption
-
-    # Monkeypatch: fix docling-ibm-models bug where LOG_LEVEL becomes a closure cell
-    # instead of an integer on Python 3.12, crashing the table structure model.
-    import docling_ibm_models.tableformer.settings as _tfs
-    _original_get_custom_logger = _tfs.get_custom_logger
-
-    def _safe_get_custom_logger(logger_name, level, stream=None):
-        import sys
-        if stream is None:
-            stream = sys.stdout
-        # If level is a cell object or otherwise invalid, default to logging.INFO
-        if not isinstance(level, (int, str)):
-            level = logging.INFO
-        return _original_get_custom_logger(logger_name, level, stream)
-
-    _tfs.get_custom_logger = _safe_get_custom_logger
-    from docling.datamodel.pipeline_options import (
-        PdfPipelineOptions,
-        EasyOcrOptions,
-        AcceleratorOptions,
-    )
-
-    # Auto-detect GPU availability
-    device = "cpu"
-    try:
-        import torch
-        if torch.cuda.is_available():
-            device = "cuda"
-            logging.info("CUDA GPU detected — using GPU acceleration")
-        else:
-            logging.info("No CUDA GPU — using CPU (conversion will be slower)")
-    except ImportError:
-        logging.info("PyTorch not available — using CPU")
-
-    pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_table_structure = True
-    pipeline_options.do_formula_enrichment = True
-    pipeline_options.do_ocr = True
-    pipeline_options.accelerator_options = AcceleratorOptions(device=device, num_threads=4 if device == "cpu" else 1)
-    # CER documents are bilingual (English + French)
-    pipeline_options.ocr_options = EasyOcrOptions(lang=["en", "fr"])
-
-    return DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
-    )
-
-
 def compute_quality_score(text: str) -> float:
     """Score converted markdown quality from 0.0 (garbled OCR) to 1.0 (clean text).
 
@@ -958,8 +890,14 @@ async def convert_one_subprocess(
 
         markdown_path = output_dir / f"{doc_id}_{slug_name}.md"
 
-        # Idempotency: skip if already converted (any non-empty file)
+        # Idempotency: the markdown already exists — e.g., a previous run wrote
+        # it but was interrupted before the DB update. Reconcile the DB here,
+        # otherwise the document stays DOWNLOADED forever and is re-scanned on
+        # every run without ever being marked CONVERTED.
         if markdown_path.exists() and markdown_path.stat().st_size > 0:
+            text = markdown_path.read_text(encoding="utf-8", errors="replace")
+            quality = compute_quality_score(PAGE_MARKER_RE.sub("", text))
+            db.mark_converted(doc_id, str(markdown_path), quality_score=quality)
             counters["already"] += 1
             return
 
@@ -1194,7 +1132,8 @@ def run_stats(args) -> None:
             client = chromadb.PersistentClient(path=str(CHROMA_DIR))
             collection = client.get_collection(name=CHROMA_COLLECTION)
             all_ids = collection.get()["ids"]
-            indexed_count = len({cid.rsplit("_chunk_", 1)[0] for cid in all_ids})
+            indexed_count = len({cid.rsplit("_chunk_", 1)[0] for cid in all_ids
+                                 if "_chunk_" in cid})
         except Exception:
             pass
 
@@ -1926,6 +1865,49 @@ def run_index(args) -> None:
 # ASK — Query the RAG pipeline
 # ===========================================================================
 
+def resolve_chunk_regions(
+    markdown_path: Optional[str],
+    chunk_text: str,
+    page_start: Optional[int],
+    page_end: Optional[int],
+    limit: int = 3,
+) -> List[Dict[str, Any]]:
+    """Match a retrieved chunk back to page regions via the bbox sidecar.
+
+    The convert stage writes <name>.bbox.json next to each Markdown file with
+    per-item text snippets and bounding boxes. This finds sidecar items whose
+    text appears in the chunk (within the chunk's page range) so citations can
+    point at the exact region on the page, not just the page number.
+    """
+    if not markdown_path:
+        return []
+    bbox_path = Path(markdown_path).with_suffix(".bbox.json")
+    if not bbox_path.exists():
+        return []
+    try:
+        sidecar = json.loads(bbox_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    chunk_norm = " ".join(chunk_text.split())
+    regions = []
+    for item in sidecar.get("items", []):
+        text = " ".join((item.get("text") or "").split())
+        if len(text) < 25:  # too short to match reliably
+            continue
+        provs = item.get("prov") or []
+        if not provs:
+            continue
+        page = provs[0].get("page")
+        if page_start and page_end and page is not None and not (page_start <= page <= page_end):
+            continue
+        if text[:120] in chunk_norm:
+            regions.append({"page": page, "bbox": provs[0].get("bbox")})
+            if len(regions) >= limit:
+                break
+    return regions
+
+
 def run_ask(args) -> None:
     """Query the indexed documents using RAG."""
     import chromadb
@@ -2073,6 +2055,23 @@ def run_ask(args) -> None:
         combined.sort(key=lambda x: x[1].get("date", "") or "")
         chunks, metadatas, distances = zip(*combined) if combined else ([], [], [])
 
+    # Look up markdown paths once so citations can resolve bbox regions
+    md_paths: Dict[str, str] = {}
+    cited_doc_ids = {m.get("document_id") for m in metadatas if m.get("document_id")}
+    if cited_doc_ids:
+        try:
+            _db = get_db(Path(args.db))
+            qmarks = ",".join("?" * len(cited_doc_ids))
+            for row in _db.conn.execute(
+                f"SELECT id, markdown_path FROM documents WHERE id IN ({qmarks})",
+                list(cited_doc_ids),
+            ):
+                if row["markdown_path"]:
+                    md_paths[row["id"]] = row["markdown_path"]
+            _db.close()
+        except Exception:
+            pass
+
     context_parts = []
     sources = []
     for i, (chunk, meta, dist) in enumerate(zip(chunks, metadatas, distances)):
@@ -2105,6 +2104,16 @@ def run_ask(args) -> None:
         doc_id = meta.get('document_id', '')
         if doc_id:
             source_info += f"\n    https://apps.cer-rec.gc.ca/REGDOCS/Item/View/{doc_id}"
+        # Pixel-level provenance from the bbox sidecar (content chunks only)
+        if doc_id and meta.get("chunk_index", -1) >= 0:
+            regions = resolve_chunk_regions(
+                md_paths.get(doc_id), chunk, meta.get("page_start"), meta.get("page_end"))
+            if regions:
+                r = regions[0]
+                b = r.get("bbox") or [0, 0, 0, 0]
+                extra = f" (+{len(regions)-1} more)" if len(regions) > 1 else ""
+                source_info += (f"\n    region: p.{r['page']} "
+                                f"bbox({b[0]:.0f},{b[1]:.0f})→({b[2]:.0f},{b[3]:.0f}){extra}")
         sources.append(source_info)
 
     context = "\n\n".join(context_parts)
@@ -2551,6 +2560,9 @@ def run_trends(args) -> None:
     if args.commodity:
         filing_metrics = [f for f in filing_metrics
                          if any(args.commodity.lower() in c.lower() for c in f["commodities"])]
+    if args.document_type:
+        filing_metrics = [f for f in filing_metrics
+                         if any(args.document_type.lower() in dt.lower() for dt in f["document_types"])]
 
     if not filing_metrics:
         print("No filings match the specified filters.")
@@ -2697,6 +2709,13 @@ def run_trends(args) -> None:
                 comparable = matches
                 est_factors.append(f"Commodity: {args.commodity}")
 
+        if args.document_type:
+            matches = [f for f in comparable
+                       if any(args.document_type.lower() in dt.lower() for dt in f["document_types"])]
+            if matches:
+                comparable = matches
+                est_factors.append(f"Document type: {args.document_type}")
+
         if args.company:
             matches = [f for f in comparable if args.company.lower() in f["company"].lower()]
             if matches:
@@ -2816,6 +2835,440 @@ def run_compliance(args) -> None:
 
     if len(gaps) > display_count:
         print(f"\n  ... and {len(gaps) - display_count} more (use --all to show all)")
+
+    print()
+
+
+# ===========================================================================
+# VERIFY — Cross-check converted Markdown against the PDF text layer
+# ===========================================================================
+
+def _extract_numbers(text: str) -> set:
+    """Extract normalized numeric tokens (2+ significant digits) from text.
+
+    Numbers are the highest-risk content in document extraction — a dropped or
+    corrupted figure is invisible in prose but changes the meaning entirely.
+    Single digits are excluded (too noisy: page numbers, list markers).
+    """
+    out = set()
+    for n in re.findall(r"\d[\d,]*(?:\.\d+)?", text):
+        n = n.replace(",", "").rstrip(".")
+        if len(n.replace(".", "")) >= 2:
+            out.add(n)
+    return out
+
+
+def run_verify(args) -> None:
+    """Verify conversion fidelity by comparing each converted Markdown against a
+    second, independent extraction of the same PDF's text layer (pypdfium2).
+
+    pypdfium2 does deterministic text extraction — it cannot hallucinate or
+    restructure content. If numbers present in the text layer are missing from
+    the Markdown, the conversion lost data. Each document gets a fidelity score
+    (numeric recall) stored in metadata; the report lists the worst offenders.
+
+    Scanned PDFs have no text layer to compare against and are reported as
+    unverifiable — for those, the OCR quality_score is the only signal.
+    """
+    import pypdfium2 as pdfium
+
+    db = get_db(Path(args.db))
+    rows = db.conn.execute(
+        """SELECT id, name, file_path, markdown_path, metadata FROM documents
+           WHERE status = 'CONVERTED'
+             AND markdown_path IS NOT NULL
+             AND file_path LIKE '%.pdf'"""
+    ).fetchall()
+
+    docs = [dict(r) for r in rows]
+    if not docs:
+        print("No converted PDF documents to verify. Run 'regdocs.py convert' first.")
+        db.close()
+        return
+
+    if args.sample and args.sample < len(docs):
+        docs = random.sample(docs, args.sample)
+
+    print(f"\nVerifying {len(docs)} converted document(s) against their PDF text layers...\n")
+
+    results = []
+    unverifiable = 0
+    errors = 0
+    for doc in tqdm(docs, desc="Verifying", unit="doc"):
+        md_path = Path(doc["markdown_path"])
+        pdf_path = Path(doc["file_path"])
+        if not md_path.exists() or not pdf_path.exists():
+            errors += 1
+            continue
+
+        try:
+            pdf = pdfium.PdfDocument(str(pdf_path))
+            page_texts = []
+            for page in pdf:
+                textpage = page.get_textpage()
+                page_texts.append(textpage.get_text_range() or "")
+                textpage.close()
+                page.close()
+            pdf.close()
+            pdf_text = "\n".join(page_texts)
+        except Exception:
+            errors += 1
+            continue
+
+        # No meaningful text layer = scanned document; nothing to compare against
+        if len(pdf_text.strip()) < 200:
+            unverifiable += 1
+            continue
+
+        md_text = re.sub(r"<!--\s*page:\d+\s*-->", "",
+                         md_path.read_text(encoding="utf-8", errors="replace"))
+
+        pdf_nums = _extract_numbers(pdf_text)
+        md_nums = _extract_numbers(md_text)
+        fidelity = len(pdf_nums & md_nums) / len(pdf_nums) if pdf_nums else 1.0
+        length_ratio = len(md_text) / max(len(pdf_text), 1)
+
+        missing_nums = pdf_nums - md_nums
+        meta = json.loads(doc["metadata"]) if doc["metadata"] else {}
+        meta["verify"] = {
+            "fidelity": round(fidelity, 3),
+            "length_ratio": round(length_ratio, 3),
+            "pdf_numbers": len(pdf_nums),
+            "missing_numbers": len(missing_nums),
+            "missing_sample": sorted(missing_nums)[:8],
+        }
+        db.update_document(doc["id"], metadata=json.dumps(meta, ensure_ascii=False))
+
+        results.append({
+            "id": doc["id"], "name": doc["name"], "fidelity": fidelity,
+            "length_ratio": length_ratio, "pdf_numbers": len(pdf_nums),
+            "missing": len(missing_nums),
+            "missing_sample": sorted(missing_nums)[:8],
+        })
+
+    db.close()
+
+    if not results:
+        print("Nothing could be verified (all scanned or errored).")
+        return
+
+    fidelities = sorted(r["fidelity"] for r in results)
+    n = len(fidelities)
+    below = [r for r in results if r["fidelity"] < args.min_fidelity]
+
+    print(f"\n{'═' * 70}")
+    print(f"  CONVERSION FIDELITY REPORT")
+    print(f"  (numeric recall: Markdown vs. PDF text layer)")
+    print(f"{'═' * 70}")
+    print(f"\n  Verified:      {n} documents")
+    print(f"  Unverifiable:  {unverifiable} (scanned — no text layer; rely on quality_score)")
+    if errors:
+        print(f"  Errors:        {errors} (missing/corrupt files)")
+    print(f"\n  Fidelity distribution:")
+    print(f"    Median:  {fidelities[n // 2]:.3f}")
+    print(f"    P10:     {fidelities[n // 10]:.3f}")
+    print(f"    Min:     {fidelities[0]:.3f}")
+    print(f"    ≥0.99:   {sum(1 for f in fidelities if f >= 0.99)} docs "
+          f"({sum(1 for f in fidelities if f >= 0.99) / n * 100:.0f}%)")
+
+    if below:
+        below.sort(key=lambda r: r["fidelity"])
+        print(f"\n{'─' * 70}")
+        print(f"  DOCUMENTS BELOW --min-fidelity {args.min_fidelity} ({len(below)})")
+        print(f"{'─' * 70}")
+        print(f"\n  {'Fidelity':>8} {'Missing':>8} {'of':>6}  Document")
+        print(f"  {'─' * 8} {'─' * 8} {'─' * 6}  {'─' * 40}")
+        show = below if args.all else below[:25]
+        for r in show:
+            name = r["name"][:55]
+            print(f"  {r['fidelity']:>8.3f} {r['missing']:>8} {r['pdf_numbers']:>6}  {name}")
+            if r["missing_sample"]:
+                print(f"           missing e.g.: {', '.join(r['missing_sample'])}")
+        if len(below) > len(show):
+            print(f"\n  ... and {len(below) - len(show)} more (use --all)")
+        print(f"\n  Interpreting the flags: numbers from letterheads, phone/fax lines, and page")
+        print(f"  footers are excluded from Markdown BY DESIGN (Docling drops page furniture).")
+        print(f"  Missing phone-number or address fragments are false alarms; missing amounts,")
+        print(f"  measurements, or condition numbers are real losses worth re-converting.")
+        print(f"\n  To re-convert the flagged documents:")
+        print(f"    UPDATE documents SET status='DOWNLOADED', markdown_path=NULL WHERE id IN (...);")
+        print(f"    python regdocs.py convert")
+    else:
+        print(f"\n  All verified documents meet the fidelity threshold. ✓")
+
+    print()
+
+
+# ===========================================================================
+# PCMR — Structured findings extraction and trend analysis for
+#        Post Construction (Environmental) Monitoring Reports
+# ===========================================================================
+
+PCMR_CATEGORIES = [
+    "Erosion and Sediment Control",
+    "Vegetation and Reclamation",
+    "Wildlife and Wetlands",
+    "Soil",
+    "Drainage and Watercourse Crossings",
+    "Landowner and Access",
+    "Noise",
+    "Other",
+]
+
+PCMR_CONTENT_CAP = 32000  # chars kept from each report before sending to the LLM
+
+
+def _pcmr_extract_content(markdown_path: str) -> Optional[str]:
+    """Read a markdown file, stripping page markers and capping length.
+
+    Keeps the head and tail of long documents (methodology tends to be at the
+    start, findings/conclusions at the end) rather than truncating from the top.
+    """
+    try:
+        text = Path(markdown_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    text = re.sub(r"<!--\s*page:\d+\s*-->", "", text).strip()
+    if len(text) <= PCMR_CONTENT_CAP:
+        return text
+    head = int(PCMR_CONTENT_CAP * 0.6)
+    tail = PCMR_CONTENT_CAP - head
+    return text[:head] + "\n\n...[TRUNCATED]...\n\n" + text[-tail:]
+
+
+def _pcmr_analyze(ollama_client, model: str, content: str) -> Optional[Dict[str, Any]]:
+    """Run an LLM extraction pass over a report, returning parsed JSON or None.
+
+    Local models occasionally emit malformed JSON (bad escaping) even in
+    format="json" mode, especially at higher temperatures. Retry once with a
+    lower temperature before giving up, since a single bad token is usually
+    the culprit and a fresh sample tends to fix it.
+    """
+    system_prompt = (
+        "You are an expert reviewer of Canada Energy Regulator (CER) post-construction "
+        "environmental monitoring reports. Read the report text and extract structured findings "
+        "as JSON with this exact shape:\n\n"
+        '{\n'
+        '  "compliance_status": "Compliant" | "Non-Compliant" | "Partially Compliant" | "Unknown",\n'
+        '  "issue_categories": [strings, chosen only from: ' + ", ".join(PCMR_CATEGORIES) + '],\n'
+        '  "findings": [\n'
+        '    {"category": one of the categories above, "description": short string, '
+        '"severity": "Minor" | "Moderate" | "Major", "resolved": true | false}\n'
+        '  ],\n'
+        '  "summary": "1-3 sentence plain-English summary of the report outcome"\n'
+        "}\n\n"
+        "Use \"Other\" for issues that don't fit the listed categories. If the report describes "
+        "no deficiencies, return an empty findings list and compliance_status \"Compliant\". "
+        "Base everything ONLY on the provided text. Output ONLY the JSON object, no commentary. "
+        "Make sure every string value is valid JSON — escape internal quotes properly and never "
+        "repeat a field's key inside its own string value."
+    )
+    for temperature in (0.1, 0.0):
+        try:
+            response = ollama_client.chat(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content},
+                ],
+                format="json",
+                stream=False,
+                options={"num_ctx": 12288, "temperature": temperature},
+                keep_alive="5m",
+            )
+            parsed = json.loads(response["message"]["content"])
+            if parsed:
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def run_pcmr(args) -> None:
+    """Extract structured findings from Post Construction Monitoring Reports and
+    aggregate them into trend statistics (issue categories, compliance rate over
+    time, companies with recurring findings).
+
+    Works directly from converted Markdown (doesn't require ChromaDB indexing).
+    Results are cached in each document's metadata (keyed by content hash) so
+    re-running this command only re-analyzes new or changed reports unless --force
+    is given.
+    """
+    import ollama as ollama_client
+
+    db = get_db(Path(args.db))
+
+    rows = db.conn.execute(
+        """SELECT id, name, hash, markdown_path, metadata FROM documents
+           WHERE markdown_path IS NOT NULL
+             AND metadata IS NOT NULL
+             AND json_extract(metadata, '$.document_types') LIKE ?""",
+        (f"%{args.document_type}%",),
+    ).fetchall()
+
+    if not rows:
+        print(f"No converted documents found with document type matching '{args.document_type}'.")
+        print("Run 'regdocs.py convert' first, or check --document-type spelling.")
+        db.close()
+        return
+
+    candidates = []
+    for row in rows:
+        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        doc_types = meta.get("document_types") or []
+        if not any(args.document_type.lower() in dt.lower() for dt in doc_types):
+            continue
+        if args.company and args.company.lower() not in (meta.get("company") or "").lower():
+            continue
+        date = meta.get("date") or ""
+        if args.after and date and date < args.after:
+            continue
+        if args.before and date and date > args.before:
+            continue
+        candidates.append({"id": row["id"], "name": row["name"], "hash": row["hash"],
+                            "markdown_path": row["markdown_path"], "meta": meta})
+
+    if args.limit:
+        candidates = candidates[: args.limit]
+
+    if not candidates:
+        print("No documents match the given filters.")
+        db.close()
+        return
+
+    print(f"\nAnalyzing {len(candidates)} document(s) matching '{args.document_type}'...\n")
+
+    results = []
+    analyzed, cached, skipped = 0, 0, 0
+    for c in tqdm(candidates, desc="Extracting findings", unit="doc"):
+        meta = c["meta"]
+        cache = meta.get("pcmr_analysis")
+        if cache and cache.get("_hash") == c["hash"] and not args.force:
+            results.append({**cache, "document_id": c["id"], "document_name": c["name"], "meta": meta})
+            cached += 1
+            continue
+
+        content = _pcmr_extract_content(c["markdown_path"])
+        if not content:
+            skipped += 1
+            continue
+
+        analysis = _pcmr_analyze(ollama_client, args.llm_model, content)
+        if analysis is None:
+            skipped += 1
+            continue
+
+        analysis["_hash"] = c["hash"]
+        meta["pcmr_analysis"] = analysis
+        db.update_document(c["id"], metadata=json.dumps(meta, ensure_ascii=False))
+        results.append({**analysis, "document_id": c["id"], "document_name": c["name"], "meta": meta})
+        analyzed += 1
+
+    db.close()
+
+    if skipped:
+        logging.warning(f"Skipped {skipped} document(s) (missing markdown or LLM extraction failed)")
+
+    if not results:
+        print("No findings could be extracted.")
+        return
+
+    if args.csv:
+        import csv
+        writer = csv.writer(sys.stdout)
+        writer.writerow(["Company", "Project", "Filing", "Date", "Compliance Status",
+                          "Issue Categories", "Summary"])
+        for r in results:
+            m = r["meta"]
+            writer.writerow([
+                m.get("company", ""), m.get("project", ""), m.get("filing_number", ""),
+                m.get("date", ""), r.get("compliance_status", "Unknown"),
+                "; ".join(r.get("issue_categories") or []), r.get("summary", ""),
+            ])
+        return
+
+    # --- Aggregate trends ---
+    status_counts: Dict[str, int] = {}
+    category_counts: Dict[str, int] = {}
+    year_counts: Dict[str, Dict[str, int]] = {}  # year -> {total, non_compliant}
+    company_issue_counts: Dict[str, int] = {}
+    unresolved_major: List[Dict[str, Any]] = []
+
+    for r in results:
+        status = r.get("compliance_status", "Unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+        year = (r["meta"].get("date") or "")[:4] or "Unknown"
+        yc = year_counts.setdefault(year, {"total": 0, "non_compliant": 0})
+        yc["total"] += 1
+        if status in ("Non-Compliant", "Partially Compliant"):
+            yc["non_compliant"] += 1
+
+        company = r["meta"].get("company") or "Unknown"
+        for cat in (r.get("issue_categories") or []):
+            category_counts[cat] = category_counts.get(cat, 0) + 1
+            company_issue_counts[company] = company_issue_counts.get(company, 0) + 1
+
+        for f in (r.get("findings") or []):
+            if isinstance(f, dict) and f.get("severity") == "Major" and not f.get("resolved", True):
+                unresolved_major.append({
+                    "company": company, "document_name": r["document_name"],
+                    "document_id": r["document_id"], "category": f.get("category", ""),
+                    "description": f.get("description", ""),
+                })
+
+    print(f"{'═' * 70}")
+    print(f"  POST CONSTRUCTION MONITORING REPORT TRENDS")
+    print(f"{'═' * 70}")
+    print(f"\n  Reports analyzed: {len(results)}  ({analyzed} newly extracted, {cached} cached)")
+
+    print(f"\n{'─' * 70}")
+    print(f"  COMPLIANCE STATUS")
+    print(f"{'─' * 70}")
+    for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
+        pct = count / len(results) * 100
+        print(f"  {status:<25} {count:>5}  ({pct:.0f}%)")
+
+    print(f"\n{'─' * 70}")
+    print(f"  ISSUE CATEGORIES (most common findings)")
+    print(f"{'─' * 70}")
+    print(f"\n  {'Category':<35} {'Count':>5}")
+    print(f"  {'─' * 35} {'─' * 5}")
+    for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
+        print(f"  {cat:<35} {count:>5}")
+
+    if len(year_counts) > 1:
+        print(f"\n{'─' * 70}")
+        print(f"  COMPLIANCE RATE BY YEAR")
+        print(f"{'─' * 70}")
+        print(f"\n  {'Year':<8} {'Reports':>8} {'Non-Compliant':>14} {'Rate':>8}")
+        print(f"  {'─' * 8} {'─' * 8} {'─' * 14} {'─' * 8}")
+        for year in sorted(year_counts):
+            yc = year_counts[year]
+            rate = yc["non_compliant"] / yc["total"] * 100 if yc["total"] else 0
+            print(f"  {year:<8} {yc['total']:>8} {yc['non_compliant']:>14} {rate:>7.0f}%")
+
+    if company_issue_counts:
+        print(f"\n{'─' * 70}")
+        print(f"  COMPANIES WITH THE MOST FLAGGED ISSUES")
+        print(f"{'─' * 70}")
+        top_companies = sorted(company_issue_counts.items(), key=lambda x: -x[1])[:10]
+        print(f"\n  {'Company':<45} {'Issues':>7}")
+        print(f"  {'─' * 45} {'─' * 7}")
+        for company, count in top_companies:
+            company_display = company[:43] if len(company) > 43 else company
+            print(f"  {company_display:<45} {count:>7}")
+
+    if unresolved_major:
+        print(f"\n{'─' * 70}")
+        print(f"  UNRESOLVED MAJOR FINDINGS ({len(unresolved_major)})")
+        print(f"{'─' * 70}\n")
+        for item in unresolved_major[:20]:
+            print(f"  • [{item['category']}] {item['company']}")
+            print(f"    {item['description']}")
+            print(f"    https://apps.cer-rec.gc.ca/REGDOCS/Item/View/{item['document_id']}\n")
+        if len(unresolved_major) > 20:
+            print(f"  ... and {len(unresolved_major) - 20} more")
 
     print()
 
@@ -3267,6 +3720,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Filter by application type")
     trends_p.add_argument("--commodity", type=str, default=None,
                           help="Filter by commodity")
+    trends_p.add_argument("--document-type", type=str, default=None,
+                          help="Filter by document type (e.g., 'Post Construction Monitoring Report')")
     trends_p.add_argument("--estimate", action="store_true",
                           help="Show duration estimate for a new filing matching these filters")
 
@@ -3277,6 +3732,38 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Filter to a specific company")
     comp_p.add_argument("--all", action="store_true",
                         help="Show all results (default shows top 30)")
+
+    # --- verify ---
+    ver_p = subparsers.add_parser("verify", help="Cross-check converted Markdown against the "
+                                  "PDF text layer to catch extraction data loss",
+                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    ver_p.add_argument("--sample", type=int, default=None,
+                       help="Verify a random sample of N documents (default: all converted)")
+    ver_p.add_argument("--min-fidelity", type=float, default=0.95,
+                       help="Flag documents whose numeric recall falls below this")
+    ver_p.add_argument("--all", action="store_true",
+                       help="List every flagged document (default shows worst 25)")
+
+    # --- pcmr ---
+    pcmr_p = subparsers.add_parser("pcmr", help="Extract findings from Post Construction Monitoring "
+                                   "Reports and analyze trends",
+                                   formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    pcmr_p.add_argument("--document-type", type=str, default="Post Construction Monitoring Report",
+                        help="Document type to match (substring)")
+    pcmr_p.add_argument("--llm-model", "--model", default=LLM_MODEL,
+                        help="Ollama model for structured extraction")
+    pcmr_p.add_argument("--company", type=str, default=None,
+                        help="Filter to a specific company")
+    pcmr_p.add_argument("--after", type=str, default=None,
+                        help="Only include reports on or after this date (YYYY-MM-DD)")
+    pcmr_p.add_argument("--before", type=str, default=None,
+                        help="Only include reports on or before this date (YYYY-MM-DD)")
+    pcmr_p.add_argument("--limit", type=int, default=None,
+                        help="Analyze at most N reports (useful for a quick test run)")
+    pcmr_p.add_argument("--force", action="store_true",
+                        help="Re-extract findings even if a cached analysis exists")
+    pcmr_p.add_argument("--csv", action="store_true",
+                        help="Output per-report findings as CSV instead of the trend report")
 
     # --- diff ---
     diff_p = subparsers.add_parser("diff", help="Compare two documents to identify changes",
@@ -3354,6 +3841,10 @@ def main():
             run_trends(args)
         elif args.command == "compliance":
             run_compliance(args)
+        elif args.command == "pcmr":
+            run_pcmr(args)
+        elif args.command == "verify":
+            run_verify(args)
         elif args.command == "diff":
             run_diff(args)
         elif args.command == "watch":

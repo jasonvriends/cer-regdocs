@@ -10,7 +10,7 @@ Future enhancements for the CER REGDOCS pipeline, roughly in priority order.
 - [ ] **Saved queries** — Let users save and name frequently-used filter combinations. Store in a `saved_queries` SQLite table.
 - [ ] **Bulk export from UI** — Add download buttons for CSV/PDF export of any analysis (compliance gaps, trends, search results).
 - [ ] **Filing timeline visualization** — Gantt-chart or timeline view showing filing progress over time. Use Plotly in Gradio.
-- [ ] **PDF viewer integration** — When citations reference page numbers, link to an embedded PDF viewer (PDF.js) showing the exact page.
+- [ ] **PDF viewer integration** — When citations reference page numbers, link to an embedded PDF viewer (PDF.js) showing the exact page — and highlight the source region. The data for this already exists: `convert` writes a `<name>.bbox.json` sidecar next to each Markdown file with per-item page numbers, bounding boxes (PDF points, origin noted), page dimensions, and text snippets for matching chunks back to page regions.
 - [ ] **Dark mode / theming** — Respect system preference.
 
 ---

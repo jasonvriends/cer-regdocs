@@ -364,6 +364,9 @@ def ask_question(
         line = f"**[{relevance}]** {name}"
         if date:
             line += f" ({date})"
+        ps, pe = meta.get("page_start"), meta.get("page_end")
+        if ps and pe:
+            line += f" p.{ps}" if ps == pe else f" pp.{ps}-{pe}"
         details = []
         if meta.get("kind"):
             details.append(meta["kind"])

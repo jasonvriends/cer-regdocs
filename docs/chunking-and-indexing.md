@@ -42,16 +42,14 @@ The convert stage uses [Docling](https://github.com/DS4SD/docling) to convert PD
 
 ### How It Works
 
-Instead of `doc.export_to_markdown()` (which produces flat text), we use:
+Instead of a single flat `doc.export_to_markdown()`, each page is exported separately and
+prefixed with an invisible page marker:
 
 ```python
-for item, _level in doc.iterate_items():
-    if hasattr(item, 'prov') and item.prov:
-        page = item.prov[0].page_no
-        if page != current_page:
-            parts.append(f"\n<!-- page:{page} -->")
-            current_page = page
-    parts.append(item.export_to_markdown())
+for page_no in sorted(doc.pages.keys()):
+    page_md = doc.export_to_markdown(page_no=page_no)
+    if page_md.strip():
+        parts.append(f"<!-- page:{page_no} -->\n\n{page_md}")
 ```
 
 This inserts invisible page markers into the Markdown:
@@ -70,6 +68,27 @@ Trans Mountain Pipeline ULC hereby applies under section 52...
 The following conditions are imposed...
 ```
 
+### Bounding-Box Sidecar
+
+Alongside each Markdown file, the converter writes `<name>.bbox.json` capturing Docling's full
+positional provenance — something Markdown itself can't carry:
+
+```json
+{
+  "pages": {"1": {"width": 612.0, "height": 792.0}, ...},
+  "items": [
+    {"label": "text",
+     "text": "As required in Condition 19 of the Canada Energy Regulator Order...",
+     "prov": [{"page": 1, "bbox": [72.0, 399.0, 541.0, 360.0], "origin": "CoordOrigin.BOTTOMLEFT"}]}
+  ]
+}
+```
+
+Coordinates are PDF points; page dimensions let a viewer normalize them. The `text` snippets
+allow matching a retrieved chunk back to its page region by substring search. This is the raw
+material for click-to-highlight PDF viewing in the UI (see TODO.md) — captured at convert time
+because regenerating it later would mean re-running the whole conversion.
+
 ### Why Whole-Document Conversion
 
 Docling processes the entire document at once because:
@@ -77,6 +96,17 @@ Docling processes the entire document at once because:
 - Tables that span pages need both pages for correct structure
 - Reading order depends on the document's overall layout
 - OCR confidence improves with more context
+
+### Verifying Conversion Fidelity
+
+Converted output can silently lose content (a layout-model misfire, a dropped table). You can't
+eyeball thousands of documents, so `regdocs.py verify` automates it: it re-extracts each PDF's
+text layer with pypdfium2 — a dumb, deterministic extractor that cannot hallucinate — and checks
+that every numeric value in the PDF made it into the Markdown. Documents below `--min-fidelity`
+are listed with the exact numbers that went missing. Letterhead artifacts (phone numbers,
+addresses) are expected misses — Docling excludes page furniture by design; missing amounts or
+measurements indicate real loss worth a re-convert. Use `--sample 200` for a quick statistical
+check of a large corpus.
 
 ### Quality Score
 

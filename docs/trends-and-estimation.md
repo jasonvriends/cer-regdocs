@@ -43,6 +43,10 @@ python regdocs.py trends --commodity "Oil"
 # By company
 python regdocs.py trends --company "Trans Mountain"
 python regdocs.py trends --company "Enbridge"
+
+# By document type — only filings that contain at least one document of this type
+python regdocs.py trends --document-type "Post Construction Monitoring Report"
+python regdocs.py trends --document-type "Compliance"
 ```
 
 ### Duration Estimation
@@ -197,6 +201,68 @@ python regdocs.py ask "Based on filing summaries, which application types \
 python regdocs.py ask --application-type "Section 52" \
   "What factors seem to correlate with longer proceedings?"
 ```
+
+---
+
+## PCMR: Post Construction Monitoring Report Trends
+
+`trends` only looks at *metadata* (dates, counts, types). The `pcmr` command goes one level
+deeper: it reads the *content* of Post Construction Monitoring Reports and extracts what the
+reports actually say.
+
+### What it does, step by step
+
+1. **Finds reports** — queries SQLite for converted documents whose `document_types`
+   includes "Post Construction Monitoring Report" (configurable via `--document-type`).
+2. **Reads each one** — loads the Markdown that the `convert` stage already produced.
+   (No OCR or PDF work happens here — it reuses the existing conversion output.)
+3. **Extracts findings via LLM** — sends the text to the Ollama model with a fixed
+   extraction schema. The model returns JSON:
+   - `compliance_status` — Compliant / Non-Compliant / Partially Compliant / Unknown
+   - `issue_categories` — from a fixed list (Erosion and Sediment Control, Vegetation and
+     Reclamation, Wildlife and Wetlands, Soil, Drainage and Watercourse Crossings,
+     Landowner and Access, Noise, Other)
+   - `findings` — individual issues with severity (Minor/Moderate/Major) and a
+     resolved/unresolved flag
+   - `summary` — 1-3 sentence plain-English outcome
+4. **Caches the result** — stored in the document's `metadata.pcmr_analysis`, keyed by the
+   file's content hash. Re-running `pcmr` is instant for already-analyzed reports; only new
+   or changed reports hit the LLM. Use `--force` to re-extract everything.
+5. **Aggregates trends** — counts across all analyzed reports:
+   - Compliance status breakdown
+   - Most common issue categories
+   - Compliance rate by year
+   - Companies with the most flagged issues
+   - Unresolved **Major** findings, each with a REGDOCS link
+
+### Usage
+
+```bash
+# Analyze all PCMRs and show the trend report
+python regdocs.py pcmr
+
+# Scope it
+python regdocs.py pcmr --company "Trans Mountain" --after 2024-01-01
+
+# Quick test on a few reports before committing to a long run
+python regdocs.py pcmr --limit 5
+
+# Per-report spreadsheet instead of the aggregate report
+python regdocs.py pcmr --csv > pcmr_findings.csv
+
+# Re-analyze everything (e.g., after switching models)
+python regdocs.py pcmr --force --model gemma4:26b
+```
+
+### Caveats
+
+- Reports must be **converted first** (`regdocs.py convert`) — `pcmr` reads Markdown, not PDFs.
+- Extraction quality depends on the LLM. Very long reports are truncated to ~32K characters
+  (head + tail kept, middle dropped) before extraction.
+- Occasionally the local model emits malformed JSON and the report is skipped (a warning shows
+  the skip count). Re-running usually succeeds — cached successes are never re-attempted.
+- Trend counts are only as good as your corpus: if you've only scouted one year, "compliance
+  rate by year" will have one row. Backfill more history for real trends (see below).
 
 ---
 

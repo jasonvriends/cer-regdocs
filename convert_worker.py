@@ -148,6 +148,40 @@ def compute_quality_score(text: str) -> float:
     return round(min(1.0, max(0.0, score)), 3)
 
 
+def build_bbox_sidecar(doc_obj) -> dict:
+    """Collect per-item page/bounding-box provenance for click-to-highlight UI.
+
+    Coordinates are PDF points as reported by Docling (origin noted per bbox,
+    typically bottom-left). Page dimensions are included so a viewer can
+    normalize. Item text (truncated) is stored so chunks can later be matched
+    back to their page regions by text search.
+    """
+    items = []
+    for item, _level in doc_obj.iterate_items():
+        prov = getattr(item, "prov", None)
+        if not prov:
+            continue
+        items.append({
+            "label": str(getattr(item, "label", "")),
+            "text": (getattr(item, "text", "") or "")[:300],
+            "prov": [
+                {
+                    "page": p.page_no,
+                    "bbox": [round(p.bbox.l, 2), round(p.bbox.t, 2),
+                             round(p.bbox.r, 2), round(p.bbox.b, 2)],
+                    "origin": str(getattr(p.bbox, "coord_origin", "")),
+                }
+                for p in prov
+            ],
+        })
+    pages = {}
+    for page_no, page in getattr(doc_obj, "pages", {}).items():
+        size = getattr(page, "size", None)
+        if size is not None:
+            pages[str(page_no)] = {"width": round(size.width, 2), "height": round(size.height, 2)}
+    return {"pages": pages, "items": items}
+
+
 def convert_document(input_path: Path, output_path: Path, html_preprocess: bool = False) -> dict:
     """Convert a single document, return result dict."""
     t0 = time.monotonic()
@@ -169,25 +203,44 @@ def convert_document(input_path: Path, output_path: Path, html_preprocess: bool 
         logging.info(f"Converting: {input_path.name}")
         result = converter.convert(convert_path)
 
-        # Build page-annotated markdown
+        # Build page-annotated markdown: export each page separately and
+        # prefix it with an invisible <!-- page:N --> marker that the index
+        # stage uses for page citations. HTML inputs have no pages dict and
+        # fall through to the whole-document export.
         doc_obj = result.document
-        current_page = None
-        parts = []
         try:
-            for item, _level in doc_obj.iterate_items():
-                if hasattr(item, 'prov') and item.prov:
-                    page = item.prov[0].page_no
-                    if page != current_page:
-                        parts.append(f"\n<!-- page:{page} -->")
-                        current_page = page
-                md = item.export_to_markdown()
-                if md and md.strip():
-                    parts.append(md)
+            parts = []
+            for page_no in sorted(doc_obj.pages.keys()):
+                page_md = doc_obj.export_to_markdown(page_no=page_no)
+                if page_md and page_md.strip():
+                    parts.append(f"<!-- page:{page_no} -->\n\n{page_md}")
             markdown_content = "\n\n".join(parts)
+            if not markdown_content.strip():
+                markdown_content = doc_obj.export_to_markdown()
         except Exception:
+            logging.warning("Per-page export failed; falling back to flat markdown", exc_info=True)
             markdown_content = doc_obj.export_to_markdown()
 
-        quality_score = compute_quality_score(markdown_content)
+        import re as _re
+        quality_score = compute_quality_score(
+            _re.sub(r"<!--\s*page:\d+\s*-->", "", markdown_content)
+        )
+
+        # Bounding-box sidecar for click-to-highlight PDF viewing (PDFs only —
+        # HTML documents have no page geometry). Failure here is non-fatal:
+        # the markdown is still valid without it.
+        bbox_path = None
+        try:
+            sidecar = build_bbox_sidecar(doc_obj)
+            if sidecar["items"]:
+                bbox_path = output_path.with_suffix(".bbox.json")
+                bbox_tmp = bbox_path.with_suffix(".tmp")
+                with open(bbox_tmp, "w", encoding="utf-8") as f:
+                    json.dump(sidecar, f, ensure_ascii=False)
+                bbox_tmp.replace(bbox_path)
+        except Exception as e:
+            logging.warning(f"Bbox sidecar failed (non-fatal): {e}")
+            bbox_path = None
 
         # Atomic write
         tmp_path = output_path.with_suffix(".tmp")
@@ -201,6 +254,7 @@ def convert_document(input_path: Path, output_path: Path, html_preprocess: bool 
         return {
             "success": True,
             "output_path": str(output_path),
+            "bbox_path": str(bbox_path) if bbox_path else None,
             "quality_score": quality_score,
             "duration_ms": duration_ms,
         }

@@ -158,6 +158,11 @@ python regdocs.py ask --model gemma4:26b \
    python regdocs.py ask --company "NGTL" "What caused delays in their applications?"
    ```
 
+7. **Use `pcmr` for monitoring-report questions.** For "what issues keep showing up in
+   post-construction monitoring?", `pcmr` reads the reports' content and aggregates structured
+   findings (compliance status, issue categories, unresolved items) — more reliable than
+   free-form `ask` for this document type. See `docs/trends-and-estimation.md`.
+
 ---
 
 ## Citation Format
@@ -168,8 +173,19 @@ Sources in `ask` output show:
 Sources:
   - Application for Pipeline Certificate (2025-03-15) pp.12-14
     [PDF; by Trans Mountain; CERA 183; Oil] (relevance: 0.87)
+    https://apps.cer-rec.gc.ca/REGDOCS/Item/View/4510256
+    region: p.12 bbox(72,494)→(542,456) (+2 more)
   - Order MO-001-2025 (2025-09-20) p.3
     [PDF; Commission; CERA 183; Oil] (relevance: 0.82)
+    https://apps.cer-rec.gc.ca/REGDOCS/Item/View/4510301
 ```
+
+Every source is cross-verifiable at three levels:
+- **REGDOCS URL** — opens the original document on the CER's site
+- **Page numbers** (`pp.12-14`) — where in the PDF the passage lives
+- **Region** (`bbox(l,t)→(r,b)`, PDF points, bottom-left origin) — the exact rectangle on the
+  page, resolved from the `.bbox.json` sidecar written at convert time. Only shown when the
+  chunk's text can be matched back to sidecar items (tables and heavily reflowed text may not
+  resolve).
 
 Includes: document name, date, page numbers, kind, submitter, application type, commodity, and relevance score.
