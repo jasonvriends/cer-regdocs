@@ -21,6 +21,12 @@ python regdocs.py trends --application-type "CERA 183" --estimate
 
 This captures the full lifecycle: application → information requests → responses → supplemental info → order/decision.
 
+**About the dates:** every document's `date` is its *filing/submission date* — the day it
+entered the CER's registry — not the date the underlying work was done or authored (verified
+against cover-letter dates inside the PDFs; see `docs/regdocs-api.md`). Durations therefore
+measure the *regulatory* timeline. For content-level dates (e.g., "when was this inspection
+actually performed?"), use `ask` or `pcmr`, which read the document text.
+
 ---
 
 ## Command Usage

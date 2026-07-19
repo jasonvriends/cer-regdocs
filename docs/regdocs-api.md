@@ -169,6 +169,14 @@ The AJAX endpoint returns a partial HTML document (no `<html>`/`<head>`) contain
 | Is file vs item | `/File/Download/` vs `/Item/View/` | URL path |
 | Date | Second `<td>` | Plain text |
 | Submitter | Third `<td>` | Plain text |
+
+**What "Date" means:** the filing/submission date — the day the document entered the CER's
+registry (for Commission-issued documents, the day it was issued/registered). Verified
+empirically: the metadata date matches the cover/transmittal letter date inside the PDFs
+(e.g., doc 4642628 is dated 2026-01-15 in REGDOCS and its cover letter reads "January 15,
+2026" — while the survey data inside is from 2018–2019). It is **not** the date the
+underlying work was performed or the content was authored. The `sd`/`ed` search parameters
+filter on this same field.
 | Company | `<details>` → sibling of "Company:" div | Link text + ID from href |
 | Project | `<details>` → sibling of "Project:" div | Link text + ID from href |
 | Filing number | `<details>` → "Filing: XXXXX" | Regex `Filing:\s*(\S+)` |
