@@ -613,10 +613,11 @@ async def download_one(
                 if file_path and Path(file_path).exists():
                     counters["already"] += 1
                     return
-                # Also check by doc_id prefix in case the name changed since download
-                existing = existing_by_stem.get(f"{doc_id}_{slug_name}")
+                # New scheme: ID-only stem. Legacy scheme: {id}_{slug} stems
+                # from before the rename — still recognized to avoid
+                # re-downloading the existing corpus.
+                existing = existing_by_stem.get(doc_id) or existing_by_stem.get(f"{doc_id}_{slug_name}")
                 if not existing:
-                    # Check if any file starts with this doc_id (handles name changes)
                     existing = next(
                         (p for stem, p in existing_by_stem.items() if stem.startswith(f"{doc_id}_")),
                         None,
@@ -646,7 +647,9 @@ async def download_one(
                                 counters["errors"] += 1
                                 return
 
-                            filename = f"{doc_id}_{slug_name}{ext}"
+                            # ID-only filename: CER titles can exceed filesystem
+                            # name limits, and the readable name lives in the DB.
+                            filename = f"{doc_id}{ext}"
                             save_path = config.output_dir / filename
                             final_url = str(response.url)
                             server_filename = unquote(Path(urlparse(final_url).path).name) or None
