@@ -27,3 +27,6 @@ markdown/
 # Local scratch scripts
 test_*
 meow.sh
+
+# Detached convert run output
+convert.log

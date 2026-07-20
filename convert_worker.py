@@ -367,6 +367,17 @@ def batch_main() -> None:
                 html_preprocess=bool(req.get("html_preprocess")),
                 converter=converter,
             )
+        # Release per-document memory before the next request: page images and
+        # tensors accumulate otherwise, which on WSL can exhaust the VM's RAM
+        # and crash the entire WSL instance (not just this process).
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
         print(RESULT_PREFIX + json.dumps(result), flush=True)
 
 

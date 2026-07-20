@@ -860,6 +860,12 @@ def compute_quality_score(text: str) -> float:
 
 RESULT_PREFIX = "RESULT "  # must match convert_worker.py
 WORKER_RECYCLE_DOCS = 500  # restart the worker periodically to bound memory growth
+WORKER_MAX_RSS_GB = 18.0   # kill the worker if it exceeds this mid-conversion.
+# On WSL, exhausting the VM's memory doesn't just OOM the process — it can
+# freeze/crash the entire WSL instance. The watchdog kills the worker first;
+# the parent marks the document failed and respawns. Also recycle between
+# documents at a lower threshold so baseline growth never nears the limit.
+WORKER_RECYCLE_RSS_GB = 12.0
 
 
 class BatchConvertWorker:
@@ -875,6 +881,20 @@ class BatchConvertWorker:
         self.proc = None
         self.startup_timeout = startup_timeout
         self.docs_converted = 0
+        self.killed_by_watchdog = None  # set to a reason string when we kill it
+
+    def rss_gb(self) -> float:
+        """Current worker resident memory in GB (0.0 if unavailable)."""
+        if self.proc is None or self.proc.pid is None:
+            return 0.0
+        try:
+            with open(f"/proc/{self.proc.pid}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / (1024 * 1024)
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0.0
 
     async def start(self) -> None:
         worker_script = Path(__file__).parent / "convert_worker.py"
@@ -919,17 +939,36 @@ class BatchConvertWorker:
         except (asyncio.TimeoutError, Exception):
             pass
 
-    async def _read_result(self, timeout: float) -> Optional[Dict[str, Any]]:
-        """Read lines until a RESULT line appears; None on timeout/EOF."""
+    async def _read_result(self, timeout: float, watch_memory: bool = False) -> Optional[Dict[str, Any]]:
+        """Read lines until a RESULT line appears; None on timeout/EOF.
+
+        With watch_memory, the worker's RSS is checked every few seconds while
+        waiting; exceeding WORKER_MAX_RSS_GB kills the worker (returns None)
+        before it can exhaust the machine's memory.
+        """
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
             try:
-                line = await asyncio.wait_for(self.proc.stdout.readline(), timeout=remaining)
+                line = await asyncio.wait_for(
+                    self.proc.stdout.readline(),
+                    timeout=min(remaining, 5.0) if watch_memory else remaining)
             except asyncio.TimeoutError:
-                return None
+                if not watch_memory:
+                    return None
+                rss = self.rss_gb()
+                if rss > WORKER_MAX_RSS_GB:
+                    self.killed_by_watchdog = f"memory watchdog: RSS {rss:.1f} GB > {WORKER_MAX_RSS_GB:.0f} GB limit"
+                    logging.warning(f"Killing worker — {self.killed_by_watchdog}")
+                    try:
+                        self.proc.kill()
+                        await self.proc.wait()
+                    except Exception:
+                        pass
+                    return None
+                continue  # still within limits; keep waiting for the result
             if not line:  # EOF — worker died
                 return None
             text = line.decode("utf-8", errors="replace").strip()
@@ -948,12 +987,13 @@ class BatchConvertWorker:
             "output": str(output_path),
             "html_preprocess": html_preprocess,
         })
+        self.killed_by_watchdog = None
         try:
             self.proc.stdin.write((req + "\n").encode("utf-8"))
             await self.proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
             return None
-        result = await self._read_result(timeout)
+        result = await self._read_result(timeout, watch_memory=True)
         if result is not None:
             self.docs_converted += 1
         return result
@@ -1041,18 +1081,24 @@ async def convert_one_batch(
         t0 = time.monotonic()
         eff_timeout = _effective_timeout(doc_path, timeout)
 
-        # Recycle the worker periodically to bound memory growth
-        if worker.docs_converted >= WORKER_RECYCLE_DOCS:
-            logging.info(f"Recycling batch worker after {worker.docs_converted} documents")
+        # Recycle the worker periodically to bound memory growth — by document
+        # count, or sooner if baseline RSS has crept up between documents
+        worker_rss = worker.rss_gb()
+        if worker.docs_converted >= WORKER_RECYCLE_DOCS or worker_rss > WORKER_RECYCLE_RSS_GB:
+            logging.info(f"Recycling batch worker ({worker.docs_converted} docs, RSS {worker_rss:.1f} GB)")
             await worker.restart()
 
         result = await worker.convert(doc_path, markdown_path, ext in (".html", ".htm"), eff_timeout)
         duration_ms = (time.monotonic() - t0) * 1000
 
         if result is None:
-            # Timeout or crash — distinguish for the error record, then respawn
+            # Watchdog kill, timeout, or crash — distinguish, then respawn
             await worker.settle()
-            if worker.crashed:
+            if worker.killed_by_watchdog:
+                error_msg = f"Killed by {worker.killed_by_watchdog}"
+                error_type = "memory"
+                logging.error(f"MEMORY ({worker.killed_by_watchdog}): {doc_path.name}")
+            elif worker.crashed:
                 error_msg = f"Worker {worker.exit_description}"
                 error_type = "crash"
                 logging.error(f"CRASH ({worker.exit_description}): {doc_path.name}")
