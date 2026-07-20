@@ -1150,6 +1150,12 @@ async def run_convert(args) -> None:
     output_dir = Path(args.output_dir)
     max_retries = getattr(args, 'max_retries', 3)
 
+    max_mem = getattr(args, 'max_worker_mem', None)
+    if max_mem:
+        global WORKER_MAX_RSS_GB
+        WORKER_MAX_RSS_GB = float(max_mem)
+        logging.info(f"Memory watchdog limit set to {WORKER_MAX_RSS_GB:.0f} GB")
+
     db = get_db(db_path)
 
     # Filter non-convertible extensions at the SQL level
@@ -3763,6 +3769,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Timeout per document in seconds (default: 600s = 10 min)")
     conv_p.add_argument("--limit", type=int, default=None,
                         help="Convert at most N documents (useful for a test run)")
+    conv_p.add_argument("--max-worker-mem", type=float, default=None, metavar="GB",
+                        help="Memory watchdog limit in GB (default 18). Raise for a "
+                             "dedicated big-document pass, e.g. 26 — but keep a few GB "
+                             "below your WSL memory cap")
     conv_p.add_argument("--dry-run", action="store_true", help="Show what would be converted without converting")
 
     # --- all ---
