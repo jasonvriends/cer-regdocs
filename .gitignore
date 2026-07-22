@@ -4,6 +4,9 @@ venv/
 __pycache__/
 *.pyc
 
+# Claude Code local settings (personal, machine-specific)
+.claude/settings.local.json
+
 # Pipeline database — regenerate with `python regdocs.py`
 # (contains public regulatory metadata; keep out of the repo)
 regdocs.db
