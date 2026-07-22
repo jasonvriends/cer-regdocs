@@ -1485,11 +1485,11 @@ def run_stats(args) -> None:
              AND status = 'NEW'"""
     ).fetchone()["cnt"]
 
-    # Count indexed docs from ChromaDB. ChromaDB's on-disk store does not
-    # support concurrent multi-process access — if `index` is actively
-    # writing, a fresh client here can hit a transient read error. Surface
-    # that distinctly instead of silently reporting 0 (which reads as "not
-    # started" when it may actually be well underway).
+    # Count indexed docs from ChromaDB. collection.get() with no limit fails
+    # on a large collection ("too many SQL variables" — the underlying SQLite
+    # store hits its bound-parameter cap around a few hundred thousand rows),
+    # so this fetches ids in pages. include=[] skips documents/metadatas —
+    # only ids are needed to derive unique document counts from chunk ids.
     indexed_count = 0
     chroma_unavailable = None
     if CHROMA_DIR.exists():
@@ -1497,11 +1497,21 @@ def run_stats(args) -> None:
             import chromadb
             client = chromadb.PersistentClient(path=str(CHROMA_DIR))
             collection = client.get_collection(name=CHROMA_COLLECTION)
-            all_ids = collection.get()["ids"]
-            indexed_count = len({cid.rsplit("_chunk_", 1)[0] for cid in all_ids
-                                 if "_chunk_" in cid})
+            doc_ids = set()
+            offset = 0
+            page_size = 5000
+            while True:
+                page = collection.get(limit=page_size, offset=offset, include=[])
+                ids = page["ids"]
+                if not ids:
+                    break
+                doc_ids.update(cid.rsplit("_chunk_", 1)[0] for cid in ids if "_chunk_" in cid)
+                offset += len(ids)
+                if len(ids) < page_size:
+                    break
+            indexed_count = len(doc_ids)
         except Exception as e:
-            chroma_unavailable = str(e)[:120]
+            chroma_unavailable = str(e)[:160]
 
     # --- Determine what the "effective" processable total is ---
     # HTML docs and non-file items won't be downloaded, so exclude from progress
@@ -1546,9 +1556,8 @@ def run_stats(args) -> None:
     print(f"  Download   {done_downloading:>5} / {processable:<5}  {progress_bar(done_downloading, processable)}  {pct(done_downloading, processable)}")
     print(f"  Convert    {converted_count:>5} / {processable:<5}  {progress_bar(converted_count, processable)}  {pct(converted_count, processable)}")
     if chroma_unavailable:
-        print(f"  Index      unavailable — likely being written to right now by an")
-        print(f"             active `index` run (ChromaDB doesn't support concurrent")
-        print(f"             access). Check progress via: tail -f index.log")
+        print(f"  Index      unavailable — {chroma_unavailable}")
+        print(f"             If `index` is actively running, check progress via: tail -f index.log")
     else:
         print(f"  Index      {indexed_count:>5} / {processable:<5}  {progress_bar(indexed_count, processable)}  {pct(indexed_count, processable)}")
     if failed_count:

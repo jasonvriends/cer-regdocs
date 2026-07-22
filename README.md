@@ -108,7 +108,7 @@ The CLI itself (`python regdocs.py convert`, `index`, `rescue`) is tied to whate
 
 All three: watch with `tail -f <name>.log`, check overall pipeline state with `python regdocs.py stats` (**only when the corresponding stage isn't actively writing** — see the ChromaDB note under `index`/`ask` below), stop with `pkill -f 'regdocs.py <stage>'`.
 
-**ChromaDB and concurrent access:** `chroma_db/` (used by `index`, `ask`, `pcmr`, and `stats`) does not support being opened by two processes at once — a second reader while `index` is actively writing can return spurious errors, and `stats` currently swallows those into a misleading "0 indexed" rather than reporting them. Avoid running `stats`, `ask`, or `pcmr` while `run-index.sh`/`regdocs.py index` is active; `tail -f index.log` is always safe since it's just reading the writer's own output.
+**ChromaDB on a large collection:** `collection.get()` with no `limit` fetches every row in one query, which fails once the collection is large enough to exceed SQLite's bound-parameter cap (hit at 275K+ chunks: `"too many SQL variables"`). `stats` pages through results in batches of 5,000 to avoid this — if you write ad-hoc scripts against `chroma_db/`, do the same rather than calling `.get()` unbounded.
 
 ---
 
