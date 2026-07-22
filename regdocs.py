@@ -1240,6 +1240,203 @@ async def run_convert(args) -> None:
 
 
 # ===========================================================================
+# RESCUE — Recover documents Docling's pipeline can't convert
+# ===========================================================================
+#
+# Most Docling failures (segfault, "Pipeline ... failed") turn out to be
+# layout/table-model crashes on structurally unusual PDFs — NOT missing
+# content. This stage tries two independent tiers, cheapest first:
+#
+#   Tier 1 (default, always tried): direct text-layer extraction via
+#   pypdfium2 — deterministic, no ML, cannot hallucinate. Fixes the vast
+#   majority: any document that HAS a text layer just needed a different
+#   extractor, not OCR.
+#
+#   Tier 2 (--vision, opt-in): for the rare document with NO text layer at
+#   all (a true scan), render each page to an image and transcribe it with
+#   a local vision-capable Ollama model. Slower and can occasionally
+#   hallucinate on dense tables, so it's reserved for documents Tier 1
+#   genuinely cannot help — gated by --max-vision-pages so a 1000-page
+#   scanned binder doesn't silently eat an entire GPU-day.
+
+def _extract_text_layer_markdown(pdf_path: Path) -> tuple:
+    """Direct per-page text extraction via pypdfium2, with the same
+    <!-- page:N --> markers the Docling path uses. Returns (markdown, page_count,
+    total_chars_extracted) — total_chars lets the caller judge whether this
+    document actually has a usable text layer at all.
+    """
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    parts = []
+    total_chars = 0
+    try:
+        for i, page in enumerate(pdf, start=1):
+            textpage = page.get_textpage()
+            text = (textpage.get_text_range() or "").strip()
+            textpage.close()
+            page.close()
+            total_chars += len(text)
+            if text:
+                parts.append(f"<!-- page:{i} -->\n\n{text}")
+        page_count = len(pdf)
+    finally:
+        pdf.close()
+    return "\n\n".join(parts), page_count, total_chars
+
+
+def _vision_transcribe_pdf(pdf_path: Path, ollama_client, model: str, max_pages: int) -> tuple:
+    """Render each page to an image and transcribe it with a vision-capable
+    Ollama model. Returns (markdown, page_count) or (None, page_count) if the
+    document exceeds max_pages (too costly/slow to be worth attempting).
+    """
+    import pypdfium2 as pdfium
+    import io
+
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    page_count = len(pdf)
+    if page_count > max_pages:
+        pdf.close()
+        return None, page_count
+
+    parts = []
+    try:
+        for i, page in enumerate(pdf, start=1):
+            bitmap = page.render(scale=2.0)
+            pil_img = bitmap.to_pil()
+            page.close()
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            response = ollama_client.chat(
+                model=model,
+                think=False,  # reasoning models (e.g. gemma4) burn a minute+ per
+                              # page "thinking" about a transcription task with no
+                              # decision to make — pure overhead here
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Transcribe all text visible in this document page exactly as it "
+                        "appears, preserving reading order. Output only the transcribed "
+                        "text — no commentary, no markdown formatting, no descriptions of "
+                        "layout or images."
+                    ),
+                    "images": [buf.getvalue()],
+                }],
+                keep_alive="5m",
+            )
+            text = response["message"]["content"].strip()
+            if text:
+                parts.append(f"<!-- page:{i} -->\n\n{text}")
+    finally:
+        pdf.close()
+    return "\n\n".join(parts), page_count
+
+
+def run_rescue(args) -> None:
+    """Attempt to recover documents that failed normal conversion."""
+    from convert_worker import detect_language
+
+    db = get_db(Path(args.db))
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    docs = db.conn.execute(
+        """SELECT id, name, file_path FROM documents
+           WHERE status = 'FAILED' AND file_path IS NOT NULL AND file_path LIKE '%.pdf'"""
+    ).fetchall()
+    docs = [dict(r) for r in docs]
+
+    if not docs:
+        print("No failed PDF documents to rescue.")
+        db.close()
+        return
+
+    print(f"\nAttempting to rescue {len(docs)} failed document(s)...\n")
+
+    ollama_client = None
+    if args.vision:
+        import ollama as ollama_client_mod
+        ollama_client = ollama_client_mod
+
+    counters = {"text_rescued": 0, "vision_rescued": 0, "still_failed": 0, "skipped_too_big": 0}
+    run_id = db.start_run("rescue", {"vision": args.vision, "vision_model": args.vision_model})
+
+    for doc in tqdm(docs, desc="Rescuing", unit="doc"):
+        doc_id, pdf_path = doc["id"], Path(doc["file_path"])
+        markdown_path = output_dir / f"{doc_id}.md"
+
+        try:
+            md_text, page_count, chars = _extract_text_layer_markdown(pdf_path)
+        except Exception as e:
+            db.mark_failed(doc_id, f"Rescue (text layer) error: {e}", "rescue")
+            counters["still_failed"] += 1
+            continue
+
+        method = None
+        # A document with a real text layer needs ~dozens of chars per page
+        # at minimum to be usable; below that it's effectively a scan.
+        if chars >= max(50, page_count * 20):
+            method = "text_fallback"
+        elif args.vision:
+            try:
+                vmd, vpc = _vision_transcribe_pdf(pdf_path, ollama_client, args.vision_model,
+                                                  args.max_vision_pages)
+            except Exception as e:
+                db.mark_failed(doc_id, f"Rescue (vision) error: {e}", "rescue")
+                counters["still_failed"] += 1
+                continue
+            if vmd is None:
+                db.mark_failed(doc_id, f"Skipped: {vpc} pages exceeds --max-vision-pages {args.max_vision_pages}", "rescue")
+                counters["skipped_too_big"] += 1
+                continue
+            md_text, page_count = vmd, vpc
+            method = "vlm"
+        else:
+            db.mark_failed(doc_id, f"No usable text layer ({chars} chars / {page_count} pages); rerun with --vision", "rescue")
+            counters["still_failed"] += 1
+            continue
+
+        if not md_text.strip():
+            db.mark_failed(doc_id, f"Rescue ({method}) produced no text", "rescue")
+            counters["still_failed"] += 1
+            continue
+
+        tmp_path = markdown_path.with_suffix(".tmp")
+        tmp_path.write_text(md_text, encoding="utf-8")
+        tmp_path.replace(markdown_path)
+
+        clean_text = PAGE_MARKER_RE.sub("", md_text)
+        quality = compute_quality_score(clean_text)
+        db.mark_converted(doc_id, str(markdown_path), quality_score=quality, metadata_update={
+            "extraction_method": method,
+            "page_count": page_count,
+            "language": detect_language(clean_text),
+        })
+        # No .bbox.json / .docling.json.gz for rescued docs — there is no
+        # Docling layout output to derive them from. Citations fall back to
+        # page-only (resolve_chunk_regions already handles a missing sidecar).
+        if method == "text_fallback":
+            counters["text_rescued"] += 1
+        else:
+            counters["vision_rescued"] += 1
+
+    db.finish_run(run_id, counters)
+    db.close()
+
+    print(f"\n{'═' * 60}")
+    print(f"  RESCUE COMPLETE")
+    print(f"{'═' * 60}")
+    print(f"  Text-layer rescued:  {counters['text_rescued']}")
+    print(f"  Vision rescued:      {counters['vision_rescued']}")
+    print(f"  Skipped (too big):   {counters['skipped_too_big']}")
+    print(f"  Still failed:        {counters['still_failed']}")
+    if counters["still_failed"] and not args.vision:
+        print(f"\n  {counters['still_failed']} document(s) have no usable text layer.")
+        print(f"  Rerun with --vision to attempt OCR via a local vision model.")
+    print()
+
+
+# ===========================================================================
 # STATS — Show pipeline status and metrics
 # ===========================================================================
 
@@ -3775,6 +3972,19 @@ def build_parser() -> argparse.ArgumentParser:
                              "below your WSL memory cap")
     conv_p.add_argument("--dry-run", action="store_true", help="Show what would be converted without converting")
 
+    # --- rescue ---
+    rescue_p = subparsers.add_parser("rescue", help="Recover documents that failed normal conversion "
+                                     "(text-layer fallback, optionally vision OCR)",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    rescue_p.add_argument("--output-dir", default="markdown", help="Directory to save Markdown files")
+    rescue_p.add_argument("--vision", action="store_true",
+                          help="For documents with no usable text layer (true scans), transcribe "
+                               "pages via a local vision-capable Ollama model")
+    rescue_p.add_argument("--vision-model", default="gemma4:26b",
+                          help="Vision-capable Ollama model for OCR fallback")
+    rescue_p.add_argument("--max-vision-pages", type=int, default=80,
+                          help="Skip vision OCR for documents longer than this (cost/time guard)")
+
     # --- all ---
     all_p = subparsers.add_parser("all", help="Run full pipeline: scout -> download -> convert",
                                   formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -4005,6 +4215,8 @@ def main():
             asyncio.run(run_download(args))
         elif args.command == "convert":
             asyncio.run(run_convert(args))
+        elif args.command == "rescue":
+            run_rescue(args)
         elif args.command == "all":
             asyncio.run(run_all(args))
         elif args.command == "stats":

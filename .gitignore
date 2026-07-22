@@ -30,3 +30,6 @@ meow.sh
 
 # Detached convert run output
 convert.log
+
+# Rescue run output
+rescue.log
