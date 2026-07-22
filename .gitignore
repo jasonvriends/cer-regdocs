@@ -33,3 +33,6 @@ convert.log
 
 # Rescue run output
 rescue.log
+
+# Index run output
+index.log
