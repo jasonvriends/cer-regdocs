@@ -1485,8 +1485,13 @@ def run_stats(args) -> None:
              AND status = 'NEW'"""
     ).fetchone()["cnt"]
 
-    # Count indexed docs from ChromaDB
+    # Count indexed docs from ChromaDB. ChromaDB's on-disk store does not
+    # support concurrent multi-process access — if `index` is actively
+    # writing, a fresh client here can hit a transient read error. Surface
+    # that distinctly instead of silently reporting 0 (which reads as "not
+    # started" when it may actually be well underway).
     indexed_count = 0
+    chroma_unavailable = None
     if CHROMA_DIR.exists():
         try:
             import chromadb
@@ -1495,8 +1500,8 @@ def run_stats(args) -> None:
             all_ids = collection.get()["ids"]
             indexed_count = len({cid.rsplit("_chunk_", 1)[0] for cid in all_ids
                                  if "_chunk_" in cid})
-        except Exception:
-            pass
+        except Exception as e:
+            chroma_unavailable = str(e)[:120]
 
     # --- Determine what the "effective" processable total is ---
     # HTML docs and non-file items won't be downloaded, so exclude from progress
@@ -1540,7 +1545,12 @@ def run_stats(args) -> None:
     print(f"  {'─' * 52}")
     print(f"  Download   {done_downloading:>5} / {processable:<5}  {progress_bar(done_downloading, processable)}  {pct(done_downloading, processable)}")
     print(f"  Convert    {converted_count:>5} / {processable:<5}  {progress_bar(converted_count, processable)}  {pct(converted_count, processable)}")
-    print(f"  Index      {indexed_count:>5} / {processable:<5}  {progress_bar(indexed_count, processable)}  {pct(indexed_count, processable)}")
+    if chroma_unavailable:
+        print(f"  Index      unavailable — likely being written to right now by an")
+        print(f"             active `index` run (ChromaDB doesn't support concurrent")
+        print(f"             access). Check progress via: tail -f index.log")
+    else:
+        print(f"  Index      {indexed_count:>5} / {processable:<5}  {progress_bar(indexed_count, processable)}  {pct(indexed_count, processable)}")
     if failed_count:
         print(f"  Failed     {failed_count:>5}             (will auto-retry)")
 
@@ -1561,7 +1571,7 @@ def run_stats(args) -> None:
         print(f"    → {dl_count} docs ready to convert{eta}")
         print(f"      Run: python regdocs.py convert")
     await_index = converted_count - indexed_count
-    if await_index > 0:
+    if await_index > 0 and not chroma_unavailable:
         print(f"    → {await_index} docs ready to index")
         print(f"      Run: python regdocs.py index")
     if pending_download == 0 and dl_count == 0 and await_index <= 0:

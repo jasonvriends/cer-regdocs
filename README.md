@@ -85,6 +85,33 @@ The web UI includes:
 
 ---
 
+## File Reference
+
+### Python
+
+| File | What it is |
+|------|-----------|
+| [`regdocs.py`](regdocs.py) | The CLI and orchestrator. Every stage (`scout`, `download`, `convert`, `rescue`, `index`, `ask`, `pcmr`, `verify`, `trends`, `compliance`, `stats`, ...) is a `run_<stage>()` function here, dispatched from `main()`. This is the file you run directly: `python regdocs.py <command>`. |
+| [`convert_worker.py`](convert_worker.py) | The Docling conversion logic, run as a **separate subprocess** per document (or as a long-lived `--batch` worker — see below) so that a segfault in Docling's native PDF code kills only the worker, never the pipeline. Not normally run directly; `regdocs.py convert` manages it. Also holds `detect_language()` and the bbox-sidecar builder, reused by `regdocs.py`'s `rescue` command. |
+| [`regdocs_db.py`](regdocs_db.py) | Thin wrapper around the SQLite database (`regdocs.db`): schema, migrations, and helper methods (`mark_converted`, `mark_failed`, `record_metric`, `search_fts`, ...). Imported by `regdocs.py` and `regdocs_ui.py`; never run directly. |
+| [`regdocs_ui.py`](regdocs_ui.py) | Gradio web UI (Explore / Timeline / Ask / Trends / Search / Compliance / Dashboard tabs). Reads the same `regdocs.db` and `chroma_db/` that the CLI writes — run it any time, including while a pipeline stage is active. Run directly: `python regdocs_ui.py`. |
+
+### Shell — detached launchers
+
+The CLI itself (`python regdocs.py convert`, `index`, `rescue`) is tied to whatever terminal starts it — close that terminal, lose the run. These wrapper scripts start the same commands via `nohup setsid` so they survive terminal closure, SSH disconnects, or a session timeout. Each refuses to start if the same stage is already running, and writes its own log file instead of the terminal.
+
+| Script | Runs | Log file | Use when |
+|--------|------|----------|----------|
+| [`run-convert.sh`](run-convert.sh) | `regdocs.py convert` | `convert.log` | Converting PDFs/HTML to Markdown — the longest stage on a large backlog (hours). Accepts extra flags, e.g. `./run-convert.sh --max-worker-mem 26` for a big-document pass. |
+| [`run-rescue.sh`](run-rescue.sh) | `regdocs.py rescue` | `rescue.log` | Recovering documents that failed normal conversion. Default is the fast text-layer fallback; `./run-rescue.sh --vision` also attempts local vision-model OCR on true scans (slow — reserve for the few documents that need it). |
+| [`run-index.sh`](run-index.sh) | `regdocs.py index` | `index.log` | Chunking + embedding converted Markdown into ChromaDB. Also long-running on a large backlog. Accepts flags, e.g. `./run-index.sh --min-quality 0.3`. |
+
+All three: watch with `tail -f <name>.log`, check overall pipeline state with `python regdocs.py stats` (**only when the corresponding stage isn't actively writing** — see the ChromaDB note under `index`/`ask` below), stop with `pkill -f 'regdocs.py <stage>'`.
+
+**ChromaDB and concurrent access:** `chroma_db/` (used by `index`, `ask`, `pcmr`, and `stats`) does not support being opened by two processes at once — a second reader while `index` is actively writing can return spurious errors, and `stats` currently swallows those into a misleading "0 indexed" rather than reporting them. Avoid running `stats`, `ask`, or `pcmr` while `run-index.sh`/`regdocs.py index` is active; `tail -f index.log` is always safe since it's just reading the writer's own output.
+
+---
+
 ## Commands
 
 | Command | What it does |
